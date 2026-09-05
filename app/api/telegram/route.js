@@ -1,1023 +1,1100 @@
-import { Bot, webhookCallback, InlineKeyboard, InputFile } from "grammy";
+import { Bot, webhookCallback, InlineKeyboard } from "grammy";
 
 const token = process.env.BOT_TOKEN;
-const OWNER_ID = Number(process.env.OWNER_ID);
+const OWNER_ID = process.env.OWNER_ID;
 
-if (!token) throw new Error("BOT_TOKEN is missing");
-if (!OWNER_ID) throw new Error("OWNER_ID is missing");
+if (!token) {
+  throw new Error("BOT_TOKEN is missing");
+}
+
+if (!OWNER_ID) {
+  throw new Error("OWNER_ID is missing");
+}
 
 const bot = new Bot(token);
 
-const sessions =
-  globalThis.__orderSessions ??
-  (globalThis.__orderSessions = new Map());
+const BASE_URL =
+  process.env.NEXT_PUBLIC_BASE_URL || "https://order-form-nagl.vercel.app";
 
-const orders =
-  globalThis.__orders ??
-  (globalThis.__orders = new Map());
-
-const PAYMENT_QR =
-  "https://order-form-nagl.vercel.app/payment-qr.jpg";
-
+const PAYMENT_QR = `${BASE_URL}/payment-qr.jpg`;
+const START_IMAGE = `${BASE_URL}/start-image.jpg`;
 const CONTACT = "https://t.me/yvaines_tg";
 
-/* =========================
-   PRICING
-========================= */
+/*
+  Temporary session storage.
+  Note: Vercel serverless instances are not guaranteed to persist memory.
+*/
+const sessions =
+  globalThis.__yvaineOrderSessions ||
+  (globalThis.__yvaineOrderSessions = new Map());
 
-const PRICES = {
-  new: {
-    title: "NEW PRICING",
-    single: 90,
-    bulk: 70,
-  },
+const orders =
+  globalThis.__yvaineOrders ||
+  (globalThis.__yvaineOrders = new Map());
 
-  noNew: {
-    title: "NO NEW PRICING",
-    single: 120,
-    bulk: 90,
-  },
+function getSession(userId) {
+  if (!sessions.has(userId)) {
+    sessions.set(userId, {
+      step: "home",
+      order: {},
+    });
+  }
 
-  yearOld: {
-    title: "YEAR OLD PRICES",
-    y2022_2024: 350,
-    y2015_2019: 550,
-  },
+  return sessions.get(userId);
+}
 
-  foreign: {
-    title: "2026 FOREIGN PRICES",
-    "700": 400,
-    "800": 600,
-    "900": 650,
-    "1000": 750,
-    "1200": 850,
-    "1400": 1150,
-    "2500": 1800,
-    "5100": 3500,
-    "6000": 4500,
-    "7000": 5300,
-    "12000": 8300,
-    "20000": 9700,
-  },
-
-  phb: {
-    title: "2026 PHB PRICES",
-    "100": 380,
-    "200": 460,
-    "300": 670,
-    "400": 790,
-    "500": 890,
-    "600": 970,
-    "700": 1500,
-    "800": 1800,
-    "900": 1900,
-    "1000": 2400,
-    "2500": 3200,
-    "3000": 4300,
-  },
-};
-
-/* =========================
-   MAIN MENU
-========================= */
+function money(amount) {
+  return `₱${Number(amount).toLocaleString("en-PH")}`;
+}
 
 function mainMenu() {
   return new InlineKeyboard()
-    .text("🛒 ORDER FORM", "order")
-    .text("💰 PRICING", "pricing")
+    .text("♱ 𝙊𝙍𝘿𝙀𝙍 𝙁𝙊𝙍𝙈 ♱", "order")
     .row()
-    .text("💳 MODE OF PAYMENT", "payment")
-    .text("📋 MY ORDER", "myorder")
+    .text("☾ 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ☾", "pricing")
     .row()
-    .url("📞 CONTACT", CONTACT);
+    .text("༒ 𝙈𝙊𝘿𝙀 𝙊𝙁 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 ༒", "payment")
+    .row()
+    .text("♰ 𝙈𝙔 𝙊𝙍𝘿𝙀𝙍 ♰", "myorder")
+    .row()
+    .text("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 ☠", "contact");
 }
 
-/* =========================
-   ORDER MENU
-========================= */
+function backHome() {
+  return new InlineKeyboard().text("༒ 𝙃𝙊𝙈𝙀 ༒", "home");
+}
 
 function orderMenu() {
   return new InlineKeyboard()
-    .text("♡ NEW", "cat:new")
-    .text("♡ NO NEW", "cat:noNew")
+    .text("♱ 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ♱", "cat_new")
     .row()
-    .text("♱ YEAR OLD", "cat:yearOld")
+    .text("♱ 𝙉𝙊 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ♱", "cat_nonew")
     .row()
-    .text("✦ 2026 FOREIGN", "cat:foreign")
-    .text("✦ 2026 PHB", "cat:phb")
+    .text("☠ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 ☠", "cat_old")
     .row()
-    .text("↩ BACK", "home");
+    .text("𓋹 𝙁𝙊𝙍𝙀𝙄𝙂𝙉 𓋹", "cat_foreign")
+    .row()
+    .text("𓋹 𝙋𝙃𝘽 𓋹", "cat_phb")
+    .row()
+    .text("༒ 𝙃𝙊𝙈𝙀", "home");
 }
 
-/* =========================
-   NICHE MENU
-========================= */
+const foreignPrices = [
+  ["700", 400],
+  ["800", 600],
+  ["900", 650],
+  ["1000", 750],
+  ["1.2K", 850],
+  ["1.4K", 1150],
+  ["2.5K", 1800],
+  ["5.1K", 3500],
+  ["6K", 4500],
+  ["7K", 5300],
+  ["12K", 8300],
+  ["20K", 9700],
+];
 
-function nicheMenu() {
-  return new InlineKeyboard()
-    .text("KPOP", "niche:kpop")
-    .text("CELEBRITY", "niche:celebrity")
-    .row()
-    .text("INFLUENCER", "niche:influencer")
-    .text("RANDOM", "niche:random")
-    .row()
-    .text("OTHER", "niche:other")
-    .row()
-    .text("↩ BACK", "order");
-}
-
-/* =========================
-   PRICE DISPLAY
-========================= */
+const phbPrices = [
+  ["100", 380],
+  ["200", 460],
+  ["300", 670],
+  ["400", 790],
+  ["500", 890],
+  ["600", 970],
+  ["700", 1500],
+  ["800", 1800],
+  ["900", 1900],
+  ["1K", 2400],
+  ["2.5K", 3200],
+  ["3K", 4300],
+];
 
 function pricingText() {
   return `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-      YVAINELY PRICES
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
 
-╭─── ⋆ NEW PRICING ⋆ ───╮
-│ • 100 followers — ₱90
-│ • 100 followers — ₱70
-│   per 10pcs
-╰──────────────────────╯
+♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐏𝐑𝐈𝐂𝐈𝐍𝐆 ♱
 
-╭─── ⋆ NO NEW PRICING ⋆ ───╮
-│ • 100 followers — ₱120
-│ • 100 followers — ₱90
-│   per 10pcs
-╰─────────────────────────╯
+༒︎ 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂
+• 100 followers — ₱90
+• 10+ accounts — ₱70/account
 
-╭─── ⋆ YEAR OLD ⋆ ───╮
-│ • 100 followers — ₱350
-│   2022–2024
-│
-│ • 100 followers — ₱550
-│   2015–2019
-╰────────────────────╯
+☠︎︎ 𝙉𝙊 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂
+• 100 followers — ₱120
+• 10+ accounts — ₱90/account
 
-╭─── ⋆ 2026 FOREIGN ⋆ ───╮
-│ • 700 — ₱400
-│ • 800 — ₱600
-│ • 900 — ₱650
-│ • 1K — ₱750
-│ • 1.2K — ₱850
-│ • 1.4K — ₱1,150
-│ • 2.5K — ₱1,800
-│ • 5.1K — ₱3,500
-│ • 6K — ₱4,500
-│ • 7K — ₱5,300
-│ • 12K — ₱8,300
-│ • 20K — ₱9,700
-╰────────────────────────╯
+𓋹 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿
+• 2022–2024 — ₱350
+• 2015–2019 — ₱550
 
-╭─── ⋆ 2026 PHB ⋆ ───╮
-│ • 100 — ₱380
-│ • 200 — ₱460
-│ • 300 — ₱670
-│ • 400 — ₱790
-│ • 500 — ₱890
-│ • 600 — ₱970
-│ • 700 — ₱1,500
-│ • 800 — ₱1,800
-│ • 900 — ₱1,900
-│ • 1K — ₱2,400
-│ • 2.5K — ₱3,200
-│ • 3K — ₱4,300
-╰─────────────────────╯
+♱ 𝟮𝟬𝟮𝟲 𝙁𝙊𝙍𝙀𝙄𝙂𝙉
+${foreignPrices.map(([size, price]) => `• ${size} — ${money(price)}`).join("\n")}
 
-♱ add ₱350 per account for foreign/phb
-   to make it old.
+♱ 𝟮𝟬𝟮𝟲 𝙋𝙃𝘽
+${phbPrices.map(([size, price]) => `• ${size} — ${money(price)}`).join("\n")}
+
+☠︎︎ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 𝘼𝘿𝘿-𝙊𝙉
+For Foreign / PHB:
++ ₱350 per account
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
 `;
 }
 
-/* =========================
-   START
-========================= */
+function paymentText() {
+  return `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐌𝐎𝐃𝐄 𝐎𝐅 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱
+
+💳 𝙂𝘾𝘼𝙎𝙃
+
+Account Name:
+𝙒𝙞𝙡𝙡𝙞𝙚 𝙍𝙚𝙦𝙪𝙞𝙧𝙤𝙣
+
+Please make sure the amount sent
+matches your exact order total.
+
+After payment, submit your receipt
+through the order form.
+
+☠︎︎ Payment is manually verified.
+A submitted receipt does not automatically
+mean that payment has been approved.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`;
+}
+
+function categoryName(category) {
+  const names = {
+    new: "NEW PRICING",
+    nonew: "NO NEW PRICING",
+    old: "YEAR OLD",
+    foreign: "2026 FOREIGN",
+    phb: "2026 PHB",
+  };
+
+  return names[category] || category;
+}
+
+function showQuantityKeyboard(category) {
+  if (category === "foreign") {
+    return new InlineKeyboard(
+      foreignPrices.map(([size, price]) => [
+        {
+          text: `${size} — ${money(price)}`,
+          callback_data: `foreign_${size}_${price}`,
+        },
+      ])
+    ).row().text("༒ 𝙃𝙊𝙈𝙀", "home");
+  }
+
+  if (category === "phb") {
+    return new InlineKeyboard(
+      phbPrices.map(([size, price]) => [
+        {
+          text: `${size} — ${money(price)}`,
+          callback_data: `phb_${size}_${price}`,
+        },
+      ])
+    ).row().text("༒ 𝙃𝙊𝙈𝙀", "home");
+  }
+
+  if (category === "old") {
+    return new InlineKeyboard()
+      .text("2022–2024 — ₱350", "old_350")
+      .row()
+      .text("2015–2019 — ₱550", "old_550")
+      .row()
+      .text("༒ 𝙃𝙊𝙈𝙀", "home");
+  }
+
+  return new InlineKeyboard()
+    .text("1 account", `basic_${category}_1`)
+    .text("5 accounts", `basic_${category}_5`)
+    .row()
+    .text("10 accounts", `basic_${category}_10`)
+    .row()
+    .text("༒ 𝙃𝙊𝙈𝙀", "home");
+}
+
+function nicheMenu(category, size, unitPrice) {
+  const keyboard = new InlineKeyboard()
+    .text("♱ 𝙎𝙄𝙉𝘾𝙀 𝟮𝟬𝟮𝟲 ♱", `niche_since_${category}_${size}_${unitPrice}`)
+    .row()
+    .text("☠ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 (+₱350) ☠", `niche_old_${category}_${size}_${unitPrice}`)
+    .row()
+    .text("༒ 𝘽𝘼𝘾𝙆", "order");
+
+  return keyboard;
+}
+
+function calculateTotal(order) {
+  const quantity = Number(order.quantity || 1);
+  const basePrice = Number(order.unitPrice || 0);
+
+  const baseTotal = basePrice * quantity;
+
+  const oldFee =
+    order.niche === "year old" && (order.category === "foreign" || order.category === "phb")
+      ? 350 * quantity
+      : 0;
+
+  return {
+    baseTotal,
+    oldFee,
+    total: baseTotal + oldFee,
+  };
+}
+
+function summaryText(order) {
+  const totals = calculateTotal(order);
+
+  return `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐎𝐑𝐃𝐄𝐑 𝐒𝐔𝐌𝐌𝐀𝐑𝐘 ♱
+
+𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙮:
+${categoryName(order.category)}
+
+𝙦𝙪𝙖𝙣𝙩𝙞𝙩𝙮:
+${order.quantity}
+
+𝙣𝙞𝙘𝙝𝙚:
+${order.niche || "not applicable"}
+
+𝙗𝙖𝙨𝙚 𝙥𝙧𝙞𝙘𝙚:
+${money(order.unitPrice)} × ${order.quantity}
+= ${money(totals.baseTotal)}
+
+${
+  totals.oldFee > 0
+    ? `𝙮𝙚𝙖𝙧-𝙤𝙡𝙙 𝙖𝙙𝙙𝙞𝙩𝙞𝙤𝙣:
+₱350 × ${order.quantity}
+= ${money(totals.oldFee)}
+
+`
+    : ""
+}𝙩𝙤𝙩𝙖𝙡 𝙖𝙢𝙤𝙪𝙣𝙩:
+♱ ${money(totals.total)} ♱
+
+Please review your order carefully
+before proceeding to payment.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`;
+}
+
+function summaryKeyboard() {
+  return new InlineKeyboard()
+    .text("💳 𝙋𝘼𝙔 𝙉𝙊𝙒", "pay_order")
+    .row()
+    .text("༒ 𝘽𝘼𝘾𝙆", "order")
+    .text("☠ 𝘾𝘼𝙉𝘾𝙀𝙇", "cancel");
+}
+
+async function sendStart(ctx) {
+  const session = getSession(ctx.from.id);
+  session.step = "home";
+  session.order = {};
+
+  await ctx.replyWithPhoto(START_IMAGE, {
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐎𝐑𝐃𝐄𝐑 𝐒𝐄𝐂𝐓𝐈𝐎𝐍 ♱
+
+ᴛʜɪꜱ ʙᴏᴛ ɪꜱ ᴅᴇᴅɪᴄᴀᴛᴇᴅ ᴛᴏ ʏᴏᴜʀ
+ᴏʀᴅᴇʀ ʀᴇQᴜᴇꜱᴛꜱ.
+
+ᴘʟᴇᴀꜱᴇ ᴄʜᴏᴏꜱᴇ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ
+ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ. ⛧
+
+ᴍᴀɴᴜᴀʟ ᴏʀᴅᴇʀ ʜᴀɴᴅʟɪɴɢ
+♱ ᴘʀɪᴄɪɴɢ & ɪɴꜰᴏ
+𓋹 ꜱᴇʀᴠɪᴄᴇꜱ
+☠︎︎ ᴄᴏɴᴛᴀᴄᴛ
+
+ᴇᴠᴇʀʏ ʀᴇQᴜᴇꜱᴛ ɪꜱ ʜᴀɴᴅʟᴇᴅ
+ᴡɪᴛʜ ᴄᴀʀᴇ & ᴀᴛᴛᴇɴᴛɪᴏɴ.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    reply_markup: mainMenu(),
+  });
+}
 
 bot.command("start", async (ctx) => {
-  sessions.set(ctx.from.id, {});
+  await sendStart(ctx);
+});
+
+bot.command("cancel", async (ctx) => {
+  sessions.delete(ctx.from.id);
 
   await ctx.reply(
-    `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-       YVAINELY ORDERS
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-
-welcome ♡
-
-please use the buttons below
-to place your order.
-
-♱ select your niche
-♱ select quantity
-♱ check your total
-♱ send payment
-♱ send your receipt
-
-your order will only be processed
-after owner confirmation.
-`,
+    "༒ 𝙊𝙧𝙙𝙚𝙧 𝙘𝙖𝙣𝙘𝙚𝙡𝙡𝙚𝙙.\n\nSend /start to begin again.",
     { reply_markup: mainMenu() }
   );
 });
-
-/* =========================
-   HOME
-========================= */
 
 bot.callbackQuery("home", async (ctx) => {
   await ctx.answerCallbackQuery();
 
-  await ctx.editMessageText(
-    `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-       YVAINELY ORDERS
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
 
-welcome ♡
+♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐎𝐑𝐃𝐄𝐑 𝐒𝐄𝐂𝐓𝐈𝐎𝐍 ♱
 
-choose an option below.
+ᴛʜɪꜱ ʙᴏᴛ ɪꜱ ᴅᴇᴅɪᴄᴀᴛᴇᴅ ᴛᴏ ʏᴏᴜʀ
+ᴏʀᴅᴇʀ ʀᴇQᴜᴇꜱᴛꜱ.
+
+ᴘʟᴇᴀꜱᴇ ᴄʜᴏᴏꜱᴇ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ
+ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ. ⛧
+
+ᴍᴀɴᴜᴀʟ ᴏʀᴅᴇʀ ʜᴀɴᴅʟɪɴɢ
+♱ ᴘʀɪᴄɪɴɢ & ɪɴꜰᴏ
+𓋹 ꜱᴇʀᴠɪᴄᴇꜱ
+☠︎︎ ᴄᴏɴᴛᴀᴄᴛ
+
+ᴇᴠᴇʀʏ ʀᴇQᴜᴇꜱᴛ ɪꜱ ʜᴀɴᴅʟᴇᴅ
+ᴡɪᴛʜ ᴄᴀʀᴇ & ᴀᴛᴛᴇɴᴛɪᴏɴ.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
 `,
-    { reply_markup: mainMenu() }
-  );
+    reply_markup: mainMenu(),
+  });
 });
 
-/* =========================
-   PRICING
-========================= */
+bot.callbackQuery("order", async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  const session = getSession(ctx.from.id);
+  session.step = "category";
+  session.order = {};
+
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐎𝐑𝐃𝐄𝐑 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 ♱
+
+please select a category below.
+
+choose the option that matches
+the item you want to request.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    reply_markup: orderMenu(),
+  });
+});
 
 bot.callbackQuery("pricing", async (ctx) => {
   await ctx.answerCallbackQuery();
 
-  await ctx.editMessageText(pricingText(), {
-    reply_markup: new InlineKeyboard()
-      .text("🛒 ORDER NOW", "order")
-      .row()
-      .text("↩ BACK", "home"),
+  await ctx.editMessageCaption({
+    caption: pricingText(),
+    reply_markup: backHome(),
   });
 });
-
-/* =========================
-   PAYMENT
-========================= */
 
 bot.callbackQuery("payment", async (ctx) => {
   await ctx.answerCallbackQuery();
 
   await ctx.replyWithPhoto(PAYMENT_QR, {
-    caption: `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-          PAYMENT
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-
-GCASH QR
-
-NAME : Willie Requiron
-
-please send the exact amount
-shown in your order.
-
-after payment, send your
-receipt here.
-
-♱ fake or altered receipts will
-   not be accepted.
-`,
-    reply_markup: new InlineKeyboard()
-      .text("🛒 PLACE ORDER", "order")
-      .row()
-      .text("↩ BACK", "home"),
+    caption: paymentText(),
+    reply_markup: backHome(),
   });
 });
 
-/* =========================
-   ORDER START
-========================= */
-
-bot.callbackQuery("order", async (ctx) => {
+bot.callbackQuery("contact", async (ctx) => {
   await ctx.answerCallbackQuery();
 
-  sessions.set(ctx.from.id, {});
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
 
-  await ctx.editMessageText(
-    `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-          ORDER FORM
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
+♱ 𝐂𝐎𝐍𝐓𝐀𝐂𝐓 ♱
 
-choose your account category:
-`,
-    { reply_markup: orderMenu() }
-  );
-});
-
-/* =========================
-   CATEGORY
-========================= */
-
-bot.callbackQuery(/^cat:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const category = ctx.match[1];
-
-  const s = sessions.get(ctx.from.id) || {};
-  s.category = category;
-  sessions.set(ctx.from.id, s);
-
-  if (category === "yearOld") {
-    await ctx.editMessageText(
-      `
-♱ YEAR OLD ACCOUNTS
-
-choose account year:
-`,
-      {
-        reply_markup: new InlineKeyboard()
-          .text("2022–2024 — ₱350", "year:2022")
-          .row()
-          .text("2015–2019 — ₱550", "year:2015")
-          .row()
-          .text("↩ BACK", "order"),
-      }
-    );
-    return;
-  }
-
-  if (category === "foreign") {
-    await ctx.editMessageText(
-      `
-✦ 2026 FOREIGN
-
-choose follower count:
-`,
-      {
-        reply_markup: foreignMenu(),
-      }
-    );
-    return;
-  }
-
-  if (category === "phb") {
-    await ctx.editMessageText(
-      `
-✦ 2026 PHB
-
-choose follower count:
-`,
-      {
-        reply_markup: phbMenu(),
-      }
-    );
-    return;
-  }
-
-  await ctx.editMessageText(
-    `
-♡ ${PRICES[category].title}
-
-choose the quantity:
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("1 ACCOUNT", `qty:${category}:1`)
-        .text("5 ACCOUNTS", `qty:${category}:5`)
-        .row()
-        .text("10 ACCOUNTS", `qty:${category}:10`)
-        .row()
-        .text("↩ BACK", "order"),
-    }
-  );
-});
-
-/* =========================
-   YEAR
-========================= */
-
-bot.callbackQuery(/^year:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const year = ctx.match[1];
-
-  const s = sessions.get(ctx.from.id) || {};
-  s.year = year;
-  s.price = year === "2022" ? 350 : 550;
-  sessions.set(ctx.from.id, s);
-
-  await ctx.editMessageText(
-    `
-♱ YEAR OLD ACCOUNT
-
-price per account:
-₱${s.price}
-
-choose quantity:
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("1 ACCOUNT", `oldqty:1`)
-        .text("5 ACCOUNTS", `oldqty:5`)
-        .row()
-        .text("10 ACCOUNTS", `oldqty:10`)
-        .row()
-        .text("↩ BACK", "order"),
-    }
-  );
-});
-
-/* =========================
-   FOREIGN MENU
-========================= */
-
-function foreignMenu() {
-  return new InlineKeyboard()
-    .text("700 — ₱400", "foreign:700")
-    .text("800 — ₱600", "foreign:800")
-    .row()
-    .text("900 — ₱650", "foreign:900")
-    .text("1K — ₱750", "foreign:1000")
-    .row()
-    .text("1.2K — ₱850", "foreign:1200")
-    .text("1.4K — ₱1,150", "foreign:1400")
-    .row()
-    .text("2.5K — ₱1,800", "foreign:2500")
-    .text("5.1K — ₱3,500", "foreign:5100")
-    .row()
-    .text("6K — ₱4,500", "foreign:6000")
-    .text("7K — ₱5,300", "foreign:7000")
-    .row()
-    .text("12K — ₱8,300", "foreign:12000")
-    .text("20K — ₱9,700", "foreign:20000")
-    .row()
-    .text("↩ BACK", "order");
-}
-
-/* =========================
-   PHB MENU
-========================= */
-
-function phbMenu() {
-  return new InlineKeyboard()
-    .text("100 — ₱380", "phb:100")
-    .text("200 — ₱460", "phb:200")
-    .row()
-    .text("300 — ₱670", "phb:300")
-    .text("400 — ₱790", "phb:400")
-    .row()
-    .text("500 — ₱890", "phb:500")
-    .text("600 — ₱970", "phb:600")
-    .row()
-    .text("700 — ₱1,500", "phb:700")
-    .text("800 — ₱1,800", "phb:800")
-    .row()
-    .text("900 — ₱1,900", "phb:900")
-    .text("1K — ₱2,400", "phb:1000")
-    .row()
-    .text("2.5K — ₱3,200", "phb:2500")
-    .text("3K — ₱4,300", "phb:3000")
-    .row()
-    .text("↩ BACK", "order");
-}
-
-/* =========================
-   FOREIGN / PHB SELECTION
-========================= */
-
-bot.callbackQuery(/^(foreign|phb):(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const [, type, followers] = ctx.match;
-
-  const price = PRICES[type][followers];
-
-  const s = sessions.get(ctx.from.id) || {};
-
-  s.category = type;
-  s.followers = followers;
-  s.unitPrice = price;
-
-  sessions.set(ctx.from.id, s);
-
-  await ctx.editMessageText(
-    `
-${type === "foreign" ? "✦ 2026 FOREIGN" : "✦ 2026 PHB"}
-
-followers: ${formatFollowers(followers)}
-price per account: ₱${price}
-
-choose quantity:
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("1 ACCOUNT", `specialqty:${type}:1`)
-        .text("2 ACCOUNTS", `specialqty:${type}:2`)
-        .row()
-        .text("5 ACCOUNTS", `specialqty:${type}:5`)
-        .text("10 ACCOUNTS", `specialqty:${type}:10`)
-        .row()
-        .text("↩ BACK", type === "foreign" ? "cat:foreign" : "cat:phb"),
-    }
-  );
-});
-
-/* =========================
-   QUANTITY
-========================= */
-
-bot.callbackQuery(/^qty:(.+):(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const [, category, qtyText] = ctx.match;
-  const qty = Number(qtyText);
-
-  const s = sessions.get(ctx.from.id) || {};
-
-  s.category = category;
-  s.quantity = qty;
-  s.unitPrice = qty >= 10
-    ? PRICES[category].bulk
-    : PRICES[category].single;
-
-  s.total = s.unitPrice * qty;
-
-  sessions.set(ctx.from.id, s);
-
-  await chooseNiche(ctx);
-});
-
-bot.callbackQuery(/^oldqty:(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const qty = Number(ctx.match[1]);
-
-  const s = sessions.get(ctx.from.id) || {};
-
-  s.quantity = qty;
-  s.unitPrice = s.price;
-  s.total = s.price * qty;
-
-  sessions.set(ctx.from.id, s);
-
-  await chooseNiche(ctx);
-});
-
-bot.callbackQuery(/^specialqty:(.+):(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const [, type, qtyText] = ctx.match;
-  const qty = Number(qtyText);
-
-  const s = sessions.get(ctx.from.id) || {};
-
-  s.quantity = qty;
-  s.unitPrice = s.unitPrice;
-  s.total = s.unitPrice * qty;
-
-  sessions.set(ctx.from.id, s);
-
-  await chooseNiche(ctx);
-});
-
-/* =========================
-   NICHE
-========================= */
-
-async function chooseNiche(ctx) {
-  await ctx.editMessageText(
-    `
-♱ choose your niche:
-
-this is for order identification
-only.
-`,
-    { reply_markup: nicheMenu() }
-  );
-}
-
-bot.callbackQuery(/^niche:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const niche = ctx.match[1];
-
-  const s = sessions.get(ctx.from.id) || {};
-  s.niche = niche;
-
-  sessions.set(ctx.from.id, s);
-
-  await showSummary(ctx);
-});
-
-/* =========================
-   SUMMARY
-========================= */
-
-async function showSummary(ctx) {
-  const s = sessions.get(ctx.from.id);
-
-  await ctx.editMessageText(
-    `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-        ORDER SUMMARY
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-
-category : ${categoryName(s)}
-niche : ${s.niche}
-quantity : ${s.quantity}
-${s.followers ? `followers : ${formatFollowers(s.followers)}\n` : ""}
-price/account : ₱${s.unitPrice}
-
-━━━━━━━━━━━━━━
-TOTAL : ₱${s.total}
-━━━━━━━━━━━━━━
-
-please make sure the amount
-you send is exactly:
-
-₱${s.total}
-
-then send your payment receipt.
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("💳 PAYMENT QR", "payment")
-        .row()
-        .text("📸 SEND RECEIPT", "receipt")
-        .row()
-        .text("❌ CANCEL ORDER", "home"),
-    }
-  );
-}
-
-/* =========================
-   RECEIPT INSTRUCTION
-========================= */
-
-bot.callbackQuery("receipt", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const s = sessions.get(ctx.from.id);
-
-  if (!s?.total) {
-    await ctx.reply("Please create an order first. ♡");
-    return;
-  }
-
-  s.waitingReceipt = true;
-  sessions.set(ctx.from.id, s);
-
-  await ctx.reply(
-    `
-📸 SEND PAYMENT RECEIPT
-
-please send your payment
-receipt as a photo.
-
-amount to pay:
-₱${s.total}
-
-your receipt will be sent to
-the owner for verification.
-
-please wait for confirmation.
-`
-  );
-});
-
-/* =========================
-   RECEIPT PHOTO
-========================= */
-
-bot.on("message:photo", async (ctx) => {
-  const s = sessions.get(ctx.from.id);
-
-  if (!s?.waitingReceipt) {
-    await ctx.reply(
-      "Please start an order first using /start. ♡"
-    );
-    return;
-  }
-
-  const photo = ctx.message.photo.at(-1);
-
-  const orderId =
-    "YV-" +
-    Date.now().toString(36).toUpperCase();
-
-  const order = {
-    id: orderId,
-    userId: ctx.from.id,
-    username: ctx.from.username || "no username",
-    firstName: ctx.from.first_name || "",
-    category: categoryName(s),
-    niche: s.niche,
-    quantity: s.quantity,
-    followers: s.followers || null,
-    unitPrice: s.unitPrice,
-    total: s.total,
-    receiptFileId: photo.file_id,
-    status: "PENDING",
-    createdAt: new Date().toISOString(),
-  };
-
-  orders.set(orderId, order);
-
-  s.waitingReceipt = false;
-  s.orderId = orderId;
-  sessions.set(ctx.from.id, s);
-
-  await ctx.reply(
-    `
-♡ RECEIPT RECEIVED
-
-order : ${orderId}
-total : ₱${order.total}
-
-your receipt has been forwarded
-to the owner for verification.
-
-please wait for confirmation.
-`
-  );
-
-  const ownerKeyboard = new InlineKeyboard()
-    .text("✓ CONFIRM PAYMENT", `confirm:${orderId}`)
-    .row()
-    .text("✕ FAIL / REJECT", `fail:${orderId}`);
-
-  await bot.api.sendPhoto(
-    OWNER_ID,
-    photo.file_id,
-    {
-      caption: `
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-          NEW ORDER
-‿̩͙⊱༒︎༻♱༺༒︎⊰‿̩͙
-
-ORDER : ${orderId}
-
-USER : ${order.firstName}
-USERNAME : @${order.username}
-
-CATEGORY : ${order.category}
-NICHE : ${order.niche}
-QUANTITY : ${order.quantity}
-${order.followers ? `FOLLOWERS : ${formatFollowers(order.followers)}\n` : ""}
-UNIT PRICE : ₱${order.unitPrice}
-
-TOTAL ORDER : ₱${order.total}
-
-⚠️ VERIFY THE RECEIPT
-AND ACTUAL PAYMENT BEFORE
-CONFIRMING.
-
-Do not rely on the receipt image alone.
-`,
-      reply_markup: ownerKeyboard,
-    }
-  );
-});
-
-/* =========================
-   OWNER CONFIRM
-========================= */
-
-bot.callbackQuery(/^confirm:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  if (ctx.from.id !== OWNER_ID) {
-    await ctx.reply("Only the owner can confirm orders.");
-    return;
-  }
-
-  const orderId = ctx.match[1];
-  const order = orders.get(orderId);
-
-  if (!order) {
-    await ctx.reply("Order not found.");
-    return;
-  }
-
-  if (order.status !== "PENDING") {
-    await ctx.reply(`This order is already ${order.status}.`);
-    return;
-  }
-
-  order.status = "CONFIRMED";
-  orders.set(orderId, order);
-
-  await bot.api.sendMessage(
-    order.userId,
-    `
-✓ PAYMENT CONFIRMED
-
-order : ${orderId}
-amount : ₱${order.total}
-
-your payment has been verified.
-
-to receive your account details,
+For questions or order assistance,
 please contact:
 
 @yvaines_tg
 
-thank you for your purchase ♡
 `,
-    {
-      reply_markup: new InlineKeyboard()
-        .url("📩 CONTACT @yvaines_tg", CONTACT)
-        .row()
-        .text("♡ HOME", "home"),
-    }
-  );
-
-  await ctx.editMessageCaption({
-    caption:
-      ctx.callbackQuery.message.caption +
-      `\n\n✓ CONFIRMED BY OWNER`,
+    reply_markup: new InlineKeyboard()
+      .url("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 𝙔𝙑𝘼𝙄𝙉𝙀 ☠", CONTACT)
+      .row()
+      .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
   });
 });
-
-/* =========================
-   OWNER FAIL
-========================= */
-
-bot.callbackQuery(/^fail:(.+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  if (ctx.from.id !== OWNER_ID) {
-    await ctx.reply("Only the owner can reject orders.");
-    return;
-  }
-
-  const orderId = ctx.match[1];
-  const order = orders.get(orderId);
-
-  if (!order) {
-    await ctx.reply("Order not found.");
-    return;
-  }
-
-  if (order.status !== "PENDING") {
-    await ctx.reply(`This order is already ${order.status}.`);
-    return;
-  }
-
-  order.status = "FAILED";
-  orders.set(orderId, order);
-
-  await bot.api.sendMessage(
-    order.userId,
-    `
-✕ PAYMENT NOT CONFIRMED
-
-order : ${orderId}
-
-we could not verify the payment
-for this order.
-
-please send the correct amount
-and a valid payment receipt to
-make the purchase.
-
-required amount:
-₱${order.total}
-
-once payment is completed,
-please submit your receipt again.
-
-♡ no account will be released
-until payment is verified.
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("💳 PAY AGAIN", "payment")
-        .row()
-        .text("📸 SEND NEW RECEIPT", "receipt")
-        .row()
-        .text("↩ HOME", "home"),
-    }
-  );
-
-  await ctx.editMessageCaption({
-    caption:
-      ctx.callbackQuery.message.caption +
-      `\n\n✕ FAILED / REJECTED BY OWNER`,
-  });
-});
-
-/* =========================
-   MY ORDER
-========================= */
 
 bot.callbackQuery("myorder", async (ctx) => {
   await ctx.answerCallbackQuery();
 
-  const s = sessions.get(ctx.from.id);
-
-  if (!s?.orderId) {
-    await ctx.editMessageText(
-      `
-📋 MY ORDER
-
-no current order found.
-
-please place an order first.
-`,
-      {
-        reply_markup: new InlineKeyboard()
-          .text("🛒 ORDER NOW", "order")
-          .row()
-          .text("↩ BACK", "home"),
-      }
-    );
-
-    return;
-  }
-
-  const order = orders.get(s.orderId);
+  const order = orders.get(ctx.from.id);
 
   if (!order) {
-    await ctx.reply("No order information found.");
+    await ctx.editMessageCaption({
+      caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐌𝐘 𝐎𝐑𝐃𝐄𝐑 ♱
+
+No order has been recorded yet.
+
+Please choose ORDER FORM
+to create an order request.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+      reply_markup: new InlineKeyboard()
+        .text("♱ 𝙊𝙍𝘿𝙀𝙍 𝙁𝙊𝙍𝙈 ♱", "order")
+        .row()
+        .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
+    });
+
     return;
   }
 
-  await ctx.editMessageText(
+  const totals = calculateTotal(order);
+
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐌𝐘 𝐎𝐑𝐃𝐄𝐑 ♱
+
+category:
+${categoryName(order.category)}
+
+quantity:
+${order.quantity}
+
+niche:
+${order.niche || "not applicable"}
+
+total:
+${money(totals.total)}
+
+status:
+${order.status || "pending"}
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    reply_markup: backHome(),
+  });
+});
+
+for (const category of ["new", "nonew"]) {
+  bot.callbackQuery(`cat_${category}`, async (ctx) => {
+    await ctx.answerCallbackQuery();
+
+    const session = getSession(ctx.from.id);
+    session.order = {
+      category,
+    };
+
+    await ctx.editMessageCaption({
+      caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ ${categoryName(category)} ♱
+
+please select the quantity below.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+      reply_markup: showQuantityKeyboard(category),
+    });
+  });
+}
+
+bot.callbackQuery("cat_old", async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  const session = getSession(ctx.from.id);
+  session.order = {
+    category: "old",
+  };
+
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐘𝐄𝐀𝐑 𝐎𝐋𝐃 ♱
+
+please select the year range.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    reply_markup: showQuantityKeyboard("old"),
+  });
+});
+
+for (const category of ["foreign", "phb"]) {
+  bot.callbackQuery(`cat_${category}`, async (ctx) => {
+    await ctx.answerCallbackQuery();
+
+    const session = getSession(ctx.from.id);
+    session.order = {
+      category,
+    };
+
+    await ctx.editMessageCaption({
+      caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ ${categoryName(category)} ♱
+
+select the size/price tier below.
+
+after selecting it, you will choose:
+
+• since 2026
+• year old (+₱350/account)
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+      reply_markup: showQuantityKeyboard(category),
+    });
+  });
+}
+
+bot.on("callback_query:data", async (ctx) => {
+  const data = ctx.callbackQuery.data;
+
+  if (
+    data.startsWith("foreign_") ||
+    data.startsWith("phb_")
+  ) {
+    await ctx.answerCallbackQuery();
+
+    const [category, size, price] = data.split("_");
+
+    const session = getSession(ctx.from.id);
+
+    session.order = {
+      ...session.order,
+      category,
+      size,
+      quantity: 1,
+      unitPrice: Number(price),
+    };
+
+    await ctx.editMessageCaption({
+      caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+selected:
+${categoryName(category)}
+
+size:
+${size}
+
+price:
+${money(price)} per account
+
+now choose the niche:
+
+♱ since 2026
+☠ year old (+₱350/account)
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+      reply_markup: nicheMenu(category, size, price),
+    });
+
+    return;
+  }
+
+  if (
+    data.startsWith("niche_since_") ||
+    data.startsWith("niche_old_")
+  ) {
+    await ctx.answerCallbackQuery();
+
+    const parts = data.split("_");
+
+    const type = parts[1];
+    const category = parts[2];
+    const size = parts[3];
+    const unitPrice = Number(parts[4]);
+
+    const session = getSession(ctx.from.id);
+
+    session.order = {
+      ...session.order,
+      category,
+      size,
+      quantity: 1,
+      unitPrice,
+      niche: type === "since" ? "since 2026" : "year old",
+    };
+
+    await ctx.editMessageCaption({
+      caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+${summaryText(session.order)}
+
+If you need more than 1 account,
+send the quantity as a number below.
+
+Example:
+2
+5
+10
+
+`,
+      reply_markup: new InlineKeyboard()
+        .text("1 account", "qty_1")
+        .text("2 accounts", "qty_2")
+        .row()
+        .text("5 accounts", "qty_5")
+        .text("10 accounts", "qty_10")
+        .row()
+        .text("༒ 𝘾𝙊𝙉𝙁𝙄𝙍𝙈 𝙏𝙊𝙏𝘼𝙇 ༒", "confirm_quantity")
+        .row()
+        .text("༒ 𝘽𝘼𝘾𝙆", "order"),
+    });
+
+    return;
+  }
+
+  if (data.startsWith("basic_")) {
+    await ctx.answerCallbackQuery();
+
+    const [, category, quantity] = data.split("_");
+
+    let unitPrice;
+
+    if (category === "new") {
+      unitPrice = Number(quantity) >= 10 ? 70 : 90;
+    } else {
+      unitPrice = Number(quantity) >= 10 ? 90 : 120;
+    }
+
+    const session = getSession(ctx.from.id);
+
+    session.order = {
+      category,
+      quantity: Number(quantity),
+      unitPrice,
+      niche: "not applicable",
+    };
+
+    await ctx.editMessageCaption({
+      caption: summaryText(session.order),
+      reply_markup: summaryKeyboard(),
+    });
+
+    return;
+  }
+
+  if (data.startsWith("old_")) {
+    await ctx.answerCallbackQuery();
+
+    const unitPrice = Number(data.split("_")[1]);
+
+    const session = getSession(ctx.from.id);
+
+    session.order = {
+      category: "old",
+      quantity: 1,
+      unitPrice,
+      niche: "year range",
+    };
+
+    await ctx.editMessageCaption({
+      caption: summaryText(session.order),
+      reply_markup: new InlineKeyboard()
+        .text("1 account", "oldqty_1")
+        .text("2 accounts", "oldqty_2")
+        .row()
+        .text("5 accounts", "oldqty_5")
+        .text("10 accounts", "oldqty_10")
+        .row()
+        .text("༒ 𝙋𝘼𝙔 𝙉𝙊𝙒 ༒", "pay_order")
+        .row()
+        .text("༒ 𝘽𝘼𝘾𝙆", "order"),
+    });
+
+    return;
+  }
+
+  if (data.startsWith("qty_")) {
+    await ctx.answerCallbackQuery();
+
+    const quantity = Number(data.split("_")[1]);
+    const session = getSession(ctx.from.id);
+
+    session.order.quantity = quantity;
+
+    await ctx.editMessageCaption({
+      caption: summaryText(session.order),
+      reply_markup: summaryKeyboard(),
+    });
+
+    return;
+  }
+
+  if (data.startsWith("oldqty_")) {
+    await ctx.answerCallbackQuery();
+
+    const quantity = Number(data.split("_")[1]);
+    const session = getSession(ctx.from.id);
+
+    session.order.quantity = quantity;
+
+    await ctx.editMessageCaption({
+      caption: summaryText(session.order),
+      reply_markup: summaryKeyboard(),
+    });
+
+    return;
+  }
+
+  if (data === "confirm_quantity") {
+    await ctx.answerCallbackQuery();
+
+    const session = getSession(ctx.from.id);
+
+    await ctx.editMessageCaption({
+      caption: summaryText(session.order),
+      reply_markup: summaryKeyboard(),
+    });
+
+    return;
+  }
+});
+
+bot.callbackQuery("cancel", async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  sessions.delete(ctx.from.id);
+
+  await ctx.editMessageCaption({
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐀𝐍𝐂𝐄𝐋𝐋𝐄𝐃 ♱
+
+Your current order has been cancelled.
+
+Send /start to begin again.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    reply_markup: mainMenu(),
+  });
+});
+
+bot.callbackQuery("pay_order", async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  const session = getSession(ctx.from.id);
+  const order = session.order;
+
+  if (!order || !order.category) {
+    await ctx.reply("Please start a new order with /start.");
+    return;
+  }
+
+  const totals = calculateTotal(order);
+
+  order.status = "awaiting payment";
+  orders.set(ctx.from.id, {
+    ...order,
+    userId: ctx.from.id,
+    username: ctx.from.username || "",
+    firstName: ctx.from.first_name || "",
+  });
+
+  await ctx.replyWithPhoto(PAYMENT_QR, {
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱
+
+Account Name:
+𝙒𝙞𝙡𝙡𝙞𝙚 𝙍𝙚𝙦𝙪𝙞𝙧𝙤𝙣
+
+Mode:
+𝙂𝘾𝘼𝙎𝙃
+
+Order total:
+♱ ${money(totals.total)} ♱
+
+Please send the exact amount.
+
+After payment, send your receipt
+as a photo in this chat.
+
+Your receipt will be manually reviewed.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+  });
+
+  await ctx.reply(
+    "☠︎︎ 𝙎𝙀𝙉𝘿 𝙔𝙊𝙐𝙍 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 𝙍𝙀𝘾𝙀𝙄𝙋𝙏 𝙃𝙀𝙍𝙀 ☠︎︎"
+  );
+});
+
+bot.on("message:photo", async (ctx) => {
+  const session = getSession(ctx.from.id);
+
+  if (!session?.order?.category) {
+    await ctx.reply(
+      "Please start an order first using /start."
+    );
+    return;
+  }
+
+  const order = session.order;
+  const totals = calculateTotal(order);
+
+  order.status = "payment verification";
+  orders.set(ctx.from.id, {
+    ...order,
+    userId: ctx.from.id,
+    username: ctx.from.username || "",
+    firstName: ctx.from.first_name || "",
+  });
+
+  const photos = ctx.message.photo;
+  const largest = photos[photos.length - 1];
+
+  const ownerKeyboard = new InlineKeyboard()
+    .text("♱ 𝘾𝙊𝙉𝙁𝙄𝙍𝙈 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 ♱", `confirm_${ctx.from.id}`)
+    .row()
+    .text("☠ 𝙁𝘼𝙄𝙇 / 𝙍𝙀𝙅𝙀𝘾𝙏 ☠", `fail_${ctx.from.id}`);
+
+  await bot.api.sendPhoto(OWNER_ID, largest.file_id, {
+    caption: `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐍𝐄𝐖 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 ♱
+
+Customer:
+${ctx.from.first_name || "Unknown"}
+
+Username:
+@${ctx.from.username || "none"}
+
+Telegram ID:
+${ctx.from.id}
+
+Category:
+${categoryName(order.category)}
+
+Quantity:
+${order.quantity}
+
+Niche:
+${order.niche || "not applicable"}
+
+Base total:
+${money(totals.baseTotal)}
+
+Year-old fee:
+${money(totals.oldFee)}
+
+TOTAL:
+♱ ${money(totals.total)} ♱
+
+Status:
+𝙈𝘼𝙉𝙐𝘼𝙇 𝙑𝙀𝙍𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉
+
+Do not approve automatically.
+Verify the actual payment and amount first.
+`,
+    reply_markup: ownerKeyboard,
+  });
+
+  await ctx.reply(`
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+♱ 𝐑𝐄𝐂𝐄𝐈𝐏𝐓 𝐑𝐄𝐂𝐄𝐈𝐕𝐄𝐃 ♱
+
+Your receipt has been submitted
+for manual verification.
+
+Please wait for confirmation.
+
+No order release should happen
+until the payment has been verified.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`);
+});
+
+bot.callbackQuery(/^confirm_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  if (String(ctx.from.id) !== String(OWNER_ID)) {
+    await ctx.answerCallbackQuery({
+      text: "Owner only.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const customerId = Number(ctx.match[1]);
+  const order = orders.get(customerId);
+
+  if (!order) {
+    await ctx.editMessageCaption({
+      caption: "Order information is no longer available.",
+    });
+    return;
+  }
+
+  order.status = "payment confirmed";
+  orders.set(customerId, order);
+
+  await bot.api.sendMessage(
+    customerId,
     `
-📋 MY ORDER
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
 
-order : ${order.id}
-category : ${order.category}
-niche : ${order.niche}
-quantity : ${order.quantity}
-total : ₱${order.total}
+♱ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃 ♱
 
-status : ${order.status}
+Your payment has been manually verified.
+
+For your order details, please contact:
+
+@yvaines_tg
+
+Your order will be handled from there.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
 `,
     {
       reply_markup: new InlineKeyboard()
-        .text("↩ BACK", "home"),
+        .url("♱ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 @𝙔𝙑𝘼𝙄𝙉𝙀𝙎_𝙏𝙂 ♱", CONTACT)
+        .row()
+        .text("☠ 𝙄𝙏𝙀𝙈 𝙍𝙀𝘾𝙀𝙄𝙑𝙀𝘿 ☠", `received_${customerId}`),
     }
   );
+
+  await ctx.editMessageCaption({
+    caption:
+      ctx.callbackQuery.message.caption +
+      "\n\n♱ PAYMENT CONFIRMED BY OWNER ♱",
+  });
 });
 
-/* =========================
-   TEXT
-========================= */
+bot.callbackQuery(/^fail_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
 
-bot.on("message:text", async (ctx) => {
-  const text = ctx.message.text.trim();
-
-  if (text.startsWith("/")) return;
-
-  const s = sessions.get(ctx.from.id);
-
-  if (s?.waitingReceipt) {
-    await ctx.reply(
-      `
-please send your payment receipt
-as a photo, not as text. ♡
-
-required amount:
-₱${s.total}
-`
-    );
-
+  if (String(ctx.from.id) !== String(OWNER_ID)) {
+    await ctx.answerCallbackQuery({
+      text: "Owner only.",
+      show_alert: true,
+    });
     return;
   }
 
-  await ctx.reply(
-    "please use the navigation buttons below. ♡",
-    { reply_markup: mainMenu() }
+  const customerId = Number(ctx.match[1]);
+  const order = orders.get(customerId);
+
+  if (order) {
+    order.status = "payment failed";
+    orders.set(customerId, order);
+  }
+
+  await bot.api.sendMessage(
+    customerId,
+    `
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+☠ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐍𝐎𝐓 𝐕𝐄𝐑𝐈𝐅𝐈𝐄𝐃 ☠
+
+Please send the correct amount/receipt
+to make your purchase.
+
+Make sure the amount you send matches
+the exact order total shown above.
+
+After making the payment, send the
+new receipt here for another verification.
+
+No order release will happen until
+payment is verified.
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("♱ 𝙋𝘼𝙔 𝘼𝙂𝘼𝙄𝙉 ♱", "pay_order")
+        .row()
+        .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
+    }
+  );
+
+  await ctx.editMessageCaption({
+    caption:
+      ctx.callbackQuery.message.caption +
+      "\n\n☠ PAYMENT REJECTED / FAILED VERIFICATION ☠",
+  });
+});
+
+bot.callbackQuery(/^received_(\d+)$/, async (ctx) => {
+  await ctx.answerCallbackQuery();
+
+  const customerId = Number(ctx.match[1]);
+
+  if (customerId !== ctx.from.id) {
+    await ctx.answerCallbackQuery({
+      text: "This button belongs to another order.",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const order = orders.get(customerId);
+
+  if (order) {
+    order.status = "completed";
+    orders.set(customerId, order);
+  }
+
+  await ctx.editMessageText(`
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
+
+thank you so much for your order ♡
+
+your order has been successfully completed.
+
+we truly appreciate your trust and support. 🕯️
+
+༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
+`);
+
+  await bot.api.sendMessage(
+    OWNER_ID,
+    `
+♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐎𝐌𝐏𝐋𝐄𝐓𝐄𝐃 ♱
+
+Customer:
+${ctx.from.first_name || "Unknown"}
+
+Username:
+@${ctx.from.username || "none"}
+
+Telegram ID:
+${ctx.from.id}
+
+The customer confirmed that the item
+was received.
+`
   );
 });
 
-/* =========================
-   HELPERS
-========================= */
-
-function categoryName(s) {
-  if (s.category === "new") return "NEW PRICING";
-  if (s.category === "noNew") return "NO NEW PRICING";
-  if (s.category === "yearOld") return "YEAR OLD";
-  if (s.category === "foreign") return "2026 FOREIGN";
-  if (s.category === "phb") return "2026 PHB";
-
-  return s.category || "UNKNOWN";
-}
-
-function formatFollowers(value) {
-  const n = Number(value);
-
-  if (n >= 1000) {
-    const k = n / 1000;
-    return Number.isInteger(k)
-      ? `${k}K`
-      : `${k.toFixed(1)}K`;
-  }
-
-  return String(n);
-}
-
 export const POST = webhookCallback(bot, "std/http");
-
 export const runtime = "nodejs";
