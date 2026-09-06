@@ -190,8 +190,8 @@ function productDetailKeyboard(p, user) {
   k.text("༒ 𝘽𝘼𝘾𝙆", "shop").text("☠ 𝙃𝙊𝙈𝙀", "home");
   return k;
 }
-
-async function showProducts(ctx, products = await productCatalog()) {
+async function showProducts(ctx, products) {
+  if (!products) products = await productCatalog();
   await ctx.reply(`${header("𝐏𝐑𝐎𝐃𝐔𝐂𝐓 𝐂𝐀𝐓𝐀𝐋𝐎𝐆")}\n\nSelect a product below.`, { reply_markup: productKeyboard(products) });
 }
 bot.callbackQuery("shop", async ctx => { await ctx.answerCallbackQuery(); await showProducts(ctx); });
