@@ -829,4 +829,1344 @@ bot.callbackQuery(/^cartminus:(.+)$/, async ctx => {
 
   const i = s.cart.findIndex(
     x => x.productId === ctx.match[1]
-  
+    );
+
+  if (i >= 0) {
+    s.cart[i].quantity--;
+
+    if (s.cart[i].quantity <= 0) {
+      s.cart.splice(i, 1);
+    }
+  }
+
+  await showCart(ctx);
+});
+
+bot.callbackQuery("clearcart", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  session(ctx.from.id).cart = [];
+
+  await showCart(ctx);
+});
+
+bot.callbackQuery("checkout", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const s = session(ctx.from.id);
+
+  if (!s.cart.length) {
+    return ctx.reply("Cart is empty.");
+  }
+
+  const products = [];
+
+  for (const item of s.cart) {
+    const p = await getProduct(item.productId);
+
+    if (!p || p.stock < item.quantity) {
+      return ctx.reply(`☠ Not enough stock for ${item.name}.`);
+    }
+
+    products.push(p);
+  }
+
+  const total = cartTotal(s.cart);
+  const id = orderId();
+
+  const o = {
+    id,
+    userId: ctx.from.id,
+    username: ctx.from.username || "",
+    items: s.cart.map(x => ({ ...x })),
+    total,
+    status: "pending",
+    paymentMethod: null,
+    receiptFileId: null,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + PAYMENT_TIMEOUT).toISOString(),
+    history: [
+      {
+        status: "pending",
+        at: new Date().toISOString()
+      }
+    ]
+  };
+
+  await saveOrder(o);
+
+  s.draft = {
+    orderId: id
+  };
+
+  await ctx.reply(
+    `${header("𝐎𝐑𝐃𝐄𝐑 𝐑𝐄𝐂𝐄𝐈𝐏𝐓")}
+
+🆔 Order ID: ${id}
+${s.cart.map(x => `• ${x.name} × ${x.quantity}`).join("\n")}
+
+TOTAL: ♱ ${money(total)} ♱
+
+⏳ Payment window: 15 minutes
+Choose a payment method.`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("💳 GCASH", "paymethod:gcash")
+        .text("💳 MAYA", "paymethod:maya")
+        .row()
+        .text("☠ CANCEL", `cancelorder:${id}`)
+    }
+  );
+});
+
+bot.callbackQuery(/^cancelorder:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o || o.userId !== ctx.from.id) {
+    return ctx.reply("Order not found.");
+  }
+
+  if (["completed", "cancelled"].includes(o.status)) {
+    return;
+  }
+
+  await updateOrderStatus(o, "cancelled");
+
+  await ctx.reply(`☠ Order ${o.id} cancelled.`);
+});
+
+bot.callbackQuery(/^paymethod:(gcash|maya)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const method = ctx.match[1];
+
+  const o = await getOrder(
+    session(ctx.from.id).draft.orderId
+  );
+
+  if (!o) {
+    return ctx.reply("Order expired.");
+  }
+
+  o.paymentMethod = method;
+
+  await saveOrder(o);
+
+  const m = PAYMENT_METHODS[method];
+
+  await ctx.replyWithPhoto(PAYMENT_QR, {
+    caption: `${header("𝐏𝐀𝐘𝐌𝐄𝐍𝐓")}
+
+Order: ${o.id}
+Method: ${m.name}
+Account: ${m.account}
+Amount: ♱ ${money(o.total)} ♱
+
+⏳ Please pay within 15 minutes.
+📸 Then send your payment receipt photo in this chat.`,
+    reply_markup: new InlineKeyboard()
+      .text("༒ 𝙈𝙔 𝙊𝙍𝘿𝙀𝙍", "orders")
+  });
+});
+
+bot.on("message:photo", async ctx => {
+  const s = session(ctx.from.id);
+  const id = s.draft.orderId;
+
+  if (!id) return;
+
+  const o = await getOrder(id);
+
+  if (!o || o.status === "cancelled") return;
+
+  o.receiptFileId =
+    ctx.message.photo.at(-1).file_id;
+
+  o.status = "payment_review";
+
+  o.history.push({
+    status: o.status,
+    at: new Date().toISOString()
+  });
+
+  await saveOrder(o);
+
+  await ctx.reply(
+    `${header("𝐑𝐄𝐂𝐄𝐈𝐏𝐓 𝐑𝐄𝐂𝐄𝐈𝐕𝐄𝐃")}
+
+Order: ${o.id}
+Status: ⌛ Payment review
+
+Please wait for admin approval.`
+  );
+
+  await bot.api.sendPhoto(
+    OWNER_ID,
+    o.receiptFileId,
+    {
+      caption: `♱ 𝐍𝐄𝐖 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱
+
+Order: ${o.id}
+Customer: ${userName(ctx)}
+Amount: ${money(o.total)}
+Method: ${PAYMENT_METHODS[o.paymentMethod]?.name || "Unknown"}
+
+Approve only after verifying the actual payment.`,
+      reply_markup: new InlineKeyboard()
+        .text("✅ APPROVE", `approve:${o.id}`)
+        .text("❌ REJECT", `reject:${o.id}`)
+        .row()
+        .text("⚙️ PROCESSING", `processing:${o.id}`)
+    }
+  );
+});
+
+async function updateOrderStatus(o, status) {
+  o.status = status;
+  o.updatedAt = new Date().toISOString();
+  o.history = o.history || [];
+
+  o.history.push({
+    status,
+    at: o.updatedAt
+  });
+
+  await saveOrder(o);
+}
+
+bot.callbackQuery(/^approve:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  for (const item of o.items) {
+    const p = await getProduct(item.productId);
+
+    if (!p || Number(p.stock) < Number(item.quantity)) {
+      return ctx.reply(
+        `☠ Cannot approve ${o.id}: insufficient stock for ${item.name}. Update stock first.`
+      );
+    }
+  }
+
+  for (const item of o.items) {
+    const p = await getProduct(item.productId);
+
+    p.stock =
+      Number(p.stock) - Number(item.quantity);
+
+    await saveProduct(p);
+  }
+
+  await updateOrderStatus(o, "paid");
+
+  const u = await getUser(o.userId);
+
+  const earned =
+    Math.max(1, Math.floor(o.total / 100));
+
+  u.points += earned;
+
+  await saveUser(u);
+
+  await bot.api.sendMessage(
+    o.userId,
+    `${header("𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃")}
+
+🧾 ORDER RECEIPT
+🆔 ${o.id}
+${o.items.map(x => `• ${x.name} × ${x.quantity}`).join("\n")}
+
+💰 TOTAL: ${money(o.total)}
+💳 ${PAYMENT_METHODS[o.paymentMethod]?.name || "Payment"}
+📦 STATUS: ♱ PAID ♱
+
+💎 Loyalty points earned: ${earned}`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text(
+          "⚙️ PROCESSING",
+          `customer_processing:${o.id}`
+        )
+        .text("📦 MY ORDERS", "orders")
+    }
+  );
+
+  await ctx.editMessageCaption({
+    caption:
+      (ctx.callbackQuery.message.caption || "") +
+      "\n\n♱ APPROVED ♱"
+  });
+});
+
+bot.callbackQuery(/^reject:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  await updateOrderStatus(
+    o,
+    "payment_failed"
+  );
+
+  await bot.api.sendMessage(
+    o.userId,
+    `☠ Payment for ${o.id} was not verified.
+
+Please make the payment correctly and submit a new receipt.`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("💳 𝙋𝘼𝙔 𝘼𝙂𝘼𝙄𝙉", "orders")
+    }
+  );
+
+  await ctx.editMessageCaption({
+    caption:
+      (ctx.callbackQuery.message.caption || "") +
+      "\n\n☠ REJECTED ☠"
+  });
+});
+
+bot.callbackQuery(/^processing:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  await updateOrderStatus(
+    o,
+    "processing"
+  );
+
+  await bot.api.sendMessage(
+    o.userId,
+    `⚙️ Order ${o.id} is now processing.`
+  );
+
+  await ctx.editMessageCaption({
+    caption:
+      (ctx.callbackQuery.message.caption || "") +
+      "\n\n⚙️ PROCESSING"
+  });
+});
+
+bot.callbackQuery(/^customer_processing:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o || o.userId !== ctx.from.id) return;
+
+  await bot.api.sendMessage(
+    OWNER_ID,
+    `Customer ${userName(ctx)} is asking about order ${o.id}.`
+  );
+
+  await ctx.reply(
+    "📨 Your request has been sent to support."
+  );
+});
+
+bot.callbackQuery("orders", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const os = (await listOrders())
+    .filter(o => o.userId === ctx.from.id)
+    .slice(0, 20);
+
+  const k = new InlineKeyboard();
+
+  os.forEach(o => {
+    k.text(
+      `${o.id} — ${o.status} — ${money(o.total)}`,
+      `vieworder:${o.id}`
+    ).row();
+  });
+
+  k.text("༒ 𝙃𝙊𝙈𝙀", "home");
+
+  await ctx.reply(
+    `${header("𝐎𝐑𝐃𝐄𝐑 𝐇𝐈𝐒𝐓𝐎𝐑𝐘")}
+
+${os.length ? "Select an order:" : "No orders yet."}`,
+    {
+      reply_markup: k
+    }
+  );
+});
+
+bot.callbackQuery(/^vieworder:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o || o.userId !== ctx.from.id) {
+    return ctx.reply("Order not found.");
+  }
+
+  const countdown =
+    o.expiresAt && o.status === "pending"
+      ? Math.max(
+          0,
+          Math.floor(
+            (new Date(o.expiresAt) - Date.now()) /
+              1000
+          )
+        )
+      : 0;
+
+  await ctx.reply(
+    `${header("𝐎𝐑𝐃𝐄𝐑 𝐓𝐑𝐀𝐂𝐊𝐈𝐍𝐆")}
+
+🆔 ${o.id}
+
+${o.items.map(x => `• ${x.name} × ${x.quantity}`).join("\n")}
+
+TOTAL: ${money(o.total)}
+💳 Payment: ${o.paymentMethod || "Not selected"}
+
+STATUS: ♱ ${o.status.toUpperCase()} ♱
+${
+  countdown
+    ? `⏳ Payment expires in about ${Math.ceil(countdown / 60)} minute(s).`
+    : ""
+}`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("⭐ 𝙇𝙀𝘼𝙑𝙀 𝙍𝙀𝙑𝙄𝙀𝙒", `review:${o.id}`)
+        .row()
+        .text("📨 𝙎𝙐𝙋𝙋𝙊𝙍𝙏", "support")
+        .text("༒ 𝙃𝙊𝙈𝙀", "home")
+    }
+  );
+});
+
+bot.callbackQuery("points", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const u = await getUser(ctx.from.id);
+
+  await ctx.reply(
+    `${header("𝐋𝐎𝐘𝐀𝐋𝐓𝐘 𝐏𝐎𝐈𝐍𝐓𝐒")}
+
+💎 Current points: ${u.points}
+
+You earn 1 point per ₱100 on approved payments.
+
+Points are stored on your account.`,
+    {
+      reply_markup: backHome(ctx.from.id)
+    }
+  );
+});
+
+bot.callbackQuery("review", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  await ctx.reply(
+    `${header("𝐑𝐄𝐕𝐈𝐄𝐖 / 𝐕𝐎𝐔𝐂𝐇")}
+
+Send your feedback as a message.
+
+Example: “fast transaction, smooth order ♡”`
+  );
+
+  session(ctx.from.id).step = "review";
+});
+
+bot.callbackQuery(/^review:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o || o.userId !== ctx.from.id) {
+    return ctx.reply("Order not found.");
+  }
+
+  session(ctx.from.id).draft.reviewOrder = o.id;
+  session(ctx.from.id).step = "review";
+
+  await ctx.reply("⭐ Send your review/vouch now.");
+});
+
+bot.callbackQuery("support", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  session(ctx.from.id).step = "support";
+
+  await ctx.reply(
+    `${header("𝐂𝐎𝐍𝐓𝐀𝐂𝐓 𝐒𝐔𝐏𝐏𝐎𝐑𝐓")}
+
+Send your concern in one message and a support ticket will be created.`
+  );
+});
+
+bot.callbackQuery("search", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  session(ctx.from.id).step = "search";
+
+  await ctx.reply(
+    "🔎 Send a product name, username, category, or keyword to search."
+  );
+});
+
+bot.callbackQuery("home", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  try {
+    await ctx.editMessageText(
+      startCaption,
+      {
+        reply_markup: homeKeyboard(ctx.from.id)
+      }
+    );
+  } catch {
+    await ctx.reply(
+      startCaption,
+      {
+        reply_markup: homeKeyboard(ctx.from.id)
+      }
+    );
+  }
+});
+
+bot.callbackQuery("pricing", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  await ctx.reply(
+    pricingText(),
+    {
+      reply_markup: backHome(ctx.from.id)
+    }
+  );
+});
+
+bot.callbackQuery("payment", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  await ctx.replyWithPhoto(
+    PAYMENT_QR,
+    {
+      caption: paymentText(),
+      reply_markup: backHome(ctx.from.id)
+    }
+  );
+});
+
+bot.callbackQuery("contact", async ctx => {
+  await ctx.answerCallbackQuery();
+
+  await ctx.reply(
+    `${header("𝐂𝐎𝐍𝐓𝐀𝐂𝐓")}
+
+For direct assistance:
+
+@yvaines_tg`,
+    {
+      reply_markup: new InlineKeyboard()
+        .url(
+          "☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 𝙔𝙑𝘼𝙄𝙉𝙀",
+          CONTACT
+        )
+        .row()
+        .text("༒ 𝙃𝙊𝙈𝙀", "home")
+    }
+  );
+});
+
+bot.on("message:text", async ctx => {
+  const s = session(ctx.from.id);
+  const text = ctx.message.text.trim();
+
+  if (text.startsWith("/")) return;
+
+  if (s.step === "search") {
+    s.step = "home";
+    await showProducts(
+      ctx,
+      await productCatalog(null, text)
+    );
+    return;
+  }
+
+  if (s.step === "review") {
+    const u = await getUser(ctx.from.id);
+    const oid = s.draft.reviewOrder || null;
+
+    u.reviews.push({
+      orderId: oid,
+      text,
+      at: new Date().toISOString()
+    });
+
+    await saveUser(u);
+
+    s.step = "home";
+
+    await ctx.reply(
+      "⭐ Thank you for your review/vouch ♡",
+      {
+        reply_markup: homeKeyboard(ctx.from.id)
+      }
+    );
+
+    return;
+  }
+
+  if (s.step === "support") {
+    const ticket = {
+      id: `T-${Date.now().toString(36).toUpperCase()}`,
+      userId: ctx.from.id,
+      username: userName(ctx),
+      text,
+      status: "open",
+      createdAt: new Date().toISOString()
+    };
+
+    await set(
+      `yf:ticket:${ticket.id}`,
+      ticket
+    );
+
+    await addSet(
+      "yf:tickets:index",
+      ticket.id
+    );
+
+    await bot.api.sendMessage(
+      OWNER_ID,
+      `📨 NEW SUPPORT TICKET
+
+${ticket.id}
+Customer: ${ticket.username}
+
+${text}`,
+      {
+        reply_markup: new InlineKeyboard()
+          .text(
+            "☠ CONTACT CUSTOMER",
+            `supportuser:${ctx.from.id}`
+          )
+      }
+    );
+
+    s.step = "home";
+
+    await ctx.reply(
+      `📨 Ticket ${ticket.id} created.
+
+Support has been notified.`,
+      {
+        reply_markup: homeKeyboard(ctx.from.id)
+      }
+    );
+
+    return;
+  }
+});
+
+bot.callbackQuery("admin", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  await ctx.reply(
+    adminText(
+      await listOrders(),
+      await listProducts()
+    ),
+    {
+      reply_markup: adminMenu()
+    }
+  );
+});
+
+bot.callbackQuery("admin_dash", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  await ctx.reply(
+    adminText(
+      await listOrders(),
+      await listProducts()
+    ),
+    {
+      reply_markup: adminMenu()
+    }
+  );
+});
+
+bot.callbackQuery("admin_orders", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const os = await listOrders();
+  const k = new InlineKeyboard();
+
+  os.slice(0, 25).forEach(o => {
+    k.text(
+      `${o.id} • ${o.status}`,
+      `adminorder:${o.id}`
+    ).row();
+  });
+
+  k.text("༒ 𝙃𝙊𝙈𝙀", "home");
+
+  await ctx.reply(
+    `${header("𝐎𝐑𝐃𝐄𝐑 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}
+
+Select an order.`,
+    {
+      reply_markup: k
+    }
+  );
+});
+
+bot.callbackQuery(/^adminorder:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  await ctx.reply(
+    `${header(o.id)}
+
+Customer: ${o.username || o.userId}
+${o.items.map(x => `• ${x.name} × ${x.quantity}`).join("\n")}
+
+Total: ${money(o.total)}
+Status: ${o.status}`,
+    {
+      reply_markup: new InlineKeyboard()
+        .text("⚙️ PROCESSING", `processing:${o.id}`)
+        .text("✓ COMPLETE", `complete:${o.id}`)
+        .row()
+        .text("❌ CANCEL", `admincancel:${o.id}`)
+        .row()
+    }
+  );
+});
+
+bot.callbackQuery(/^complete:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  await updateOrderStatus(
+    o,
+    "completed"
+  );
+
+  await bot.api.sendMessage(
+    o.userId,
+    `♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐎𝐌𝐏𝐋𝐄𝐓𝐄𝐃 ♱
+
+${o.id}
+Your order has been completed. Thank you ♡`
+  );
+
+  await ctx.reply(
+    "✓ Marked completed."
+  );
+});
+
+bot.callbackQuery(/^admincancel:(.+)$/, async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const o = await getOrder(ctx.match[1]);
+
+  if (!o) return;
+
+  await updateOrderStatus(
+    o,
+    "cancelled"
+  );
+
+  await ctx.reply(
+    "Order cancelled."
+  );
+});
+
+bot.callbackQuery("admin_products", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const ps = await listProducts();
+
+  await ctx.reply(
+    `${header("𝐏𝐑𝐎𝐃𝐔𝐂𝐓 / 𝐒𝐓𝐎𝐂𝐊 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}
+
+${ps.map(p =>
+  `• ${p.name} — ${money(p.price)} — stock ${p.stock}`
+).join("\n") || "No products yet."}
+
+Use /addproduct to add one.`,
+    {
+      reply_markup: adminMenu()
+    }
+  );
+});
+
+bot.callbackQuery("admin_customers", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const ids = await listSet("yf:users:index");
+  const users = [];
+
+  for (const id of ids) {
+    const u = await getUser(id);
+
+    if (u) users.push(u);
+  }
+
+  await ctx.reply(
+    `${header("𝐂𝐔𝐒𝐓𝐎𝐌𝐄𝐑 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}
+
+${
+  users.slice(0, 30).map(u =>
+    `• ${u.firstName || u.id} ${
+      u.username ? "(" + u.username + ")" : ""
+    } — ${u.points} pts`
+  ).join("\n") || "No users recorded yet."
+}`,
+    {
+      reply_markup: adminMenu()
+    }
+  );
+});
+
+bot.callbackQuery("admin_analytics", async ctx => {
+  if (!isAdmin(ctx.from.id)) {
+    return ctx.answerCallbackQuery({
+      text: "Admin only.",
+      show_alert: true
+    });
+  }
+
+  await ctx.answerCallbackQuery();
+
+  const os = await listOrders();
+  const byStatus = {};
+
+  for (const o of os) {
+    byStatus[o.status] =
+      (byStatus[o.status] || 0) + 1;
+  }
+
+  await ctx.reply(
+    `${header("𝐒𝐀𝐋𝐄𝐒 𝐀𝐍𝐀𝐋𝐘𝐓𝐈𝐂𝐒")}
+
+Orders: ${os.length}
+Paid: ${byStatus.paid || 0}
+Processing: ${byStatus.processing || 0}
+Completed: ${byStatus.completed || 0}
+Pending review: ${byStatus.payment_review || 0}
+Revenue recorded: ${money(
+  os.filter(o =>
+    ["paid", "processing", "completed"]
+      .includes(o.status)
+  ).reduce(
+    (s, o) => s + Number(o.total),
+    0
+  )
+)}`,
+    {
+      reply_markup: adminMenu()
+    }
+  );
+});
+
+bot.command("addproduct", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "addproduct";
+
+  await ctx.reply(
+    `➕ Send product in this format:
+
+Name | Price | Stock | Category | Description
+
+Example:
+500 followers | 890 | 10 | PHB | available account`
+  );
+});
+
+bot.command("editstock", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "editstock";
+
+  await ctx.reply(
+    "📦 Send: product-id | new-stock"
+  );
+});
+
+bot.command("deleteproduct", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "deleteproduct";
+
+  await ctx.reply(
+    "🗑 Send the product ID to delete."
+  );
+});
+
+bot.command("editproduct", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "editproduct";
+
+  await ctx.reply(
+    "✏️ Send: product-id | name | price | stock | category | description"
+  );
+});
+
+bot.command("tickets", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const ids =
+    await listSet("yf:tickets:index");
+
+  const lines = [];
+
+  for (const id of ids) {
+    const t = await get(
+      `yf:ticket:${id}`
+    );
+
+    if (t) {
+      lines.push(
+        `• ${t.id} — ${t.status} — ${t.username}\n${t.text}`
+      );
+    }
+  }
+
+  await ctx.reply(
+    `${header("𝐒𝐔𝐏𝐏𝐎𝐑𝐓 𝐓𝐈𝐂𝐊𝐄𝐓𝐒")}
+
+${lines.join("\n\n") || "No tickets."}`
+  );
+});
+
+bot.command("broadcast", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "broadcast";
+
+  await ctx.reply(
+    "📢 Send the broadcast message."
+  );
+});
+
+bot.command("ban", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "ban";
+
+  await ctx.reply(
+    "🚫 Send the Telegram user ID to ban."
+  );
+});
+
+bot.command("unban", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "unban";
+
+  await ctx.reply(
+    "♰ Send the Telegram user ID to ban."
+  );
+});
+
+bot.command("unban", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  session(ctx.from.id).step =
+    "unban";
+
+  await ctx.reply(
+    "♰ Send the Telegram user ID to unban."
+  );
+});
+
+bot.on("message:text", async ctx => {
+  if (!isAdmin(ctx.from.id)) return;
+
+  const s = session(ctx.from.id);
+  const text = ctx.message.text.trim();
+
+  if (s.step === "editproduct") {
+    const [
+      id,
+      name,
+      price,
+      stock,
+      category,
+      ...desc
+    ] = text.split("|").map(x => x.trim());
+
+    const p = await getProduct(id);
+
+    if (
+      !p ||
+      !name ||
+      isNaN(Number(price)) ||
+      isNaN(Number(stock))
+    ) {
+      return ctx.reply(
+        "Invalid product ID or format."
+      );
+    }
+
+    Object.assign(p, {
+      name,
+      price: Number(price),
+      stock: Number(stock),
+      category: category || p.category,
+      description:
+        desc.join(" | ") || p.description
+    });
+
+    await saveProduct(p);
+
+    s.step = "home";
+
+    await ctx.reply(
+      `✏️ Updated ${p.name} (${p.id})`
+    );
+
+    return;
+  }
+
+  if (s.step === "addproduct") {
+    const [
+      name,
+      price,
+      stock,
+      category,
+      ...desc
+    ] = text.split("|").map(x => x.trim());
+
+    if (
+      !name ||
+      isNaN(Number(price)) ||
+      isNaN(Number(stock))
+    ) {
+      return ctx.reply(
+        "Invalid format."
+      );
+    }
+
+    const p = {
+      id:
+        `P-${Date.now().toString(36).toUpperCase()}`,
+      name,
+      price: Number(price),
+      stock: Number(stock),
+      category:
+        category || "General",
+      description:
+        desc.join(" | ")
+    };
+
+    await saveProduct(p);
+
+    s.step = "home";
+
+    await ctx.reply(
+      `➕ Added ${p.name}\nID: ${p.id}`
+    );
+
+    return;
+  }
+
+  if (s.step === "editstock") {
+    const [
+      id,
+      stock
+    ] = text.split("|").map(x => x.trim());
+
+    const p = await getProduct(id);
+
+    if (
+      !p ||
+      isNaN(Number(stock))
+    ) {
+      return ctx.reply(
+        "Product not found or invalid stock."
+      );
+    }
+
+    const was = p.stock;
+
+    p.stock =
+      Math.max(0, Number(stock));
+
+    await saveProduct(p);
+
+    s.step = "home";
+
+    await ctx.reply(
+      `📦 ${p.name} stock: ${was} → ${p.stock}`
+    );
+
+    if (was <= 0 && p.stock > 0) {
+      const ids =
+        await listSet("yf:users:index");
+
+      for (const uid of ids) {
+        const u = await getUser(uid);
+
+        if (
+          u?.watching?.includes(p.id)
+        ) {
+          await bot.api.sendMessage(
+            uid,
+            `🔔 RESTOCK ALERT
+
+${p.name} is available again!`,
+            {
+              reply_markup:
+                new InlineKeyboard()
+                  .text(
+                    "🛍 VIEW PRODUCT",
+                    `prod:${p.id}`
+                  )
+            }
+          );
+
+          u.watching =
+            u.watching.filter(
+              x => x !== p.id
+            );
+
+          await saveUser(u);
+        }
+      }
+    }
+
+    return;
+  }
+
+  if (s.step === "deleteproduct") {
+    const p = await getProduct(text);
+
+    if (!p) {
+      return ctx.reply(
+        "Product not found."
+      );
+    }
+
+    await del(
+      `yf:product:${p.id}`
+    );
+
+    await removeSet(
+      "yf:products:index",
+      p.id
+    );
+
+    s.step = "home";
+
+    await ctx.reply(
+      `🗑 Deleted ${p.name}`
+    );
+
+    return;
+  }
+
+  if (s.step === "broadcast") {
+    const ids =
+      await listSet("yf:users:index");
+
+    let sent = 0;
+
+    for (const uid of ids) {
+      try {
+        await bot.api.sendMessage(
+          uid,
+          text
+        );
+
+        sent++;
+      } catch {}
+    }
+
+    s.step = "home";
+
+    await ctx.reply(
+      `📢 Broadcast sent to ${sent} users.`
+    );
+
+    return;
+  }
+
+  if (
+    s.step === "ban" ||
+    s.step === "unban"
+  ) {
+    const id = text;
+    const u = await getUser(id);
+
+    u.id = Number(id);
+    u.banned =
+      s.step === "ban";
+
+    await saveUser(u);
+
+    s.step = "home";
+
+    await ctx.reply(
+      `${u.banned ? "🚫 Banned" : "♰ Unbanned"} ${id}`
+    );
+
+    return;
+  }
+});
+
+export async function GET(req) {
+  const secret =
+    process.env.CRON_SECRET;
+
+  if (
+    secret &&
+    req.headers.get("authorization") !==
+      `Bearer ${secret}`
+  ) {
+    return new Response(
+      "Unauthorized",
+      { status: 401 }
+    );
+  }
+
+  const now = Date.now();
+
+  const os = await listOrders();
+
+  let expired = 0;
+
+  for (const o of os) {
+    if (
+      o.status === "pending" &&
+      o.expiresAt &&
+      new Date(o.expiresAt).getTime() <= now
+    ) {
+      await updateOrderStatus(
+        o,
+        "cancelled"
+      );
+
+      expired++;
+
+      try {
+        await bot.api.sendMessage(
+          o.userId,
+          `☠ Order ${o.id} expired because payment was not received within 15 minutes.
+
+You may create a new order anytime.`
+        );
+      } catch {}
+    }
+  }
+
+  return Response.json({
+    ok: true,
+    expired,
+    persistent
+  });
+}
+
+export const POST =
+  webhookCallback(bot, "std/http");
+
+export const runtime = "nodejs";
