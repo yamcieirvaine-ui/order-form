@@ -1,1100 +1,480 @@
 import { Bot, webhookCallback, InlineKeyboard } from "grammy";
+import {
+  get, set, del, incr, listSet, addSet, removeSet, persistent
+} from "../../../lib/store.js";
 
 const token = process.env.BOT_TOKEN;
 const OWNER_ID = process.env.OWNER_ID;
 
-if (!token) {
-  throw new Error("BOT_TOKEN is missing");
-}
-
-if (!OWNER_ID) {
-  throw new Error("OWNER_ID is missing");
-}
+if (!token) throw new Error("BOT_TOKEN is missing");
+if (!OWNER_ID) throw new Error("OWNER_ID is missing");
 
 const bot = new Bot(token);
-
-const BASE_URL =
-  process.env.NEXT_PUBLIC_BASE_URL || "https://order-form-nagl.vercel.app";
-
+const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL || "https://order-form-nagl.vercel.app";
 const PAYMENT_QR = `${BASE_URL}/payment-qr.jpg`;
 const START_IMAGE = `${BASE_URL}/start-image.jpg`;
 const CONTACT = "https://t.me/yvaines_tg";
+const ADMIN_IDS = new Set(
+  String(process.env.ADMIN_IDS || OWNER_ID).split(",").map(x => x.trim()).filter(Boolean)
+);
+const PAYMENT_METHODS = {
+  gcash: { name: "𝙂𝘾𝘼𝙎𝙃", account: "𝙒𝙞𝙡𝙡𝙞𝙚 𝙍𝙚𝙦𝙪𝙞𝙧𝙤𝙣" },
+  maya: { name: "𝙈𝘼𝙔𝘼", account: process.env.MAYA_ACCOUNT || "Set MAYA_ACCOUNT" }
+};
+const PAYMENT_TIMEOUT = 15 * 60 * 1000;
 
-/*
-  Temporary session storage.
-  Note: Vercel serverless instances are not guaranteed to persist memory.
-*/
-const sessions =
-  globalThis.__yvaineOrderSessions ||
-  (globalThis.__yvaineOrderSessions = new Map());
+function money(amount) { return `₱${Number(amount || 0).toLocaleString("en-PH")}`; }
+function isAdmin(id) { return ADMIN_IDS.has(String(id)); }
+function userName(ctx) {
+  return ctx.from.username ? `@${ctx.from.username}` : ctx.from.first_name || "Customer";
+}
+function orderId() { return `YF-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random()*90+10)}`; }
 
-const orders =
-  globalThis.__yvaineOrders ||
-  (globalThis.__yvaineOrders = new Map());
-
-function getSession(userId) {
-  if (!sessions.has(userId)) {
-    sessions.set(userId, {
-      step: "home",
-      order: {},
-    });
+async function getUser(id) {
+  const key = `yf:user:${id}`;
+  return await get(key, {
+    id, username: "", firstName: "", banned: false, points: 0,
+    favorites: [], watching: [], reviews: [], tickets: []
+  });
+}
+async function saveUser(u) { await set(`yf:user:${u.id}`, u); await addSet("yf:users:index", u.id); return u; }
+async function getOrder(id) { return get(`yf:order:${id}`); }
+async function saveOrder(o) {
+  await set(`yf:order:${o.id}`, o);
+  await addSet("yf:orders:index", o.id);
+  return o;
+}
+async function getProduct(id) { return get(`yf:product:${id}`); }
+async function saveProduct(p) {
+  await set(`yf:product:${p.id}`, p);
+  await addSet("yf:products:index", p.id);
+  return p;
+}
+async function seedProducts() {
+  if ((await listSet("yf:products:index")).length) return;
+  const seed = [
+    ["NEW-100","100 followers — New Pricing",90,999,"NEW PRICING"],
+    ["NONEW-100","100 followers — No New Pricing",120,999,"NO NEW PRICING"],
+    ["OLD-2022","Year Old 2022–2024",350,999,"YEAR OLD"],
+    ["OLD-2015","Year Old 2015–2019",550,999,"YEAR OLD"],
+    ...foreignPrices.map(([size,price])=>[`FOREIGN-${size.replace(/[^0-9A-Z]/gi,"")}`,`${size} followers — 2026 Foreign`,price,999,"2026 FOREIGN"]),
+    ...phbPrices.map(([size,price])=>[`PHB-${size.replace(/[^0-9A-Z]/gi,"")}`,`${size} followers — 2026 PHB`,price,999,"2026 PHB"]),
+  ];
+  for (const [id,name,price,stock,category] of seed)
+    await saveProduct({id,name,price,stock,category,description:"Available for order. Please verify the listing details before checkout."});
+}
+async function listProducts() {
+  await seedProducts();
+  const ids = await listSet("yf:products:index");
+  const out = [];
+  for (const id of ids) {
+    const p = await getProduct(id);
+    if (p) out.push(p);
   }
-
-  return sessions.get(userId);
+  return out.sort((a,b) => String(a.name).localeCompare(String(b.name)));
+}
+async function listOrders() {
+  const ids = await listSet("yf:orders:index");
+  const out = [];
+  for (const id of ids) {
+    const o = await getOrder(id);
+    if (o) out.push(o);
+  }
+  return out.sort((a,b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
-function money(amount) {
-  return `₱${Number(amount).toLocaleString("en-PH")}`;
+const sessions = globalThis.__yvaineSessions || (globalThis.__yvaineSessions = new Map());
+function session(id) {
+  if (!sessions.has(id)) sessions.set(id, { step: "home", cart: [], draft: {} });
+  return sessions.get(id);
 }
+function clearSession(id) { sessions.delete(id); }
 
-function mainMenu() {
-  return new InlineKeyboard()
-    .text("♱ 𝙊𝙍𝘿𝙀𝙍 𝙁𝙊𝙍𝙈 ♱", "order")
-    .row()
-    .text("☾ 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ☾", "pricing")
-    .row()
-    .text("༒ 𝙈𝙊𝘿𝙀 𝙊𝙁 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 ༒", "payment")
-    .row()
-    .text("♰ 𝙈𝙔 𝙊𝙍𝘿𝙀𝙍 ♰", "myorder")
-    .row()
-    .text("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 ☠", "contact");
+function header(title) {
+  return `༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎\n\n♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐅𝐋𝐄𝐔𝐑 ♱\n\n${title}`;
 }
-
-function backHome() {
-  return new InlineKeyboard().text("༒ 𝙃𝙊𝙈𝙀 ༒", "home");
+function mainMenu(admin = false) {
+  const k = new InlineKeyboard()
+    .text("♱ 𝙎𝙃𝙊𝙋", "shop").text("🔎 𝙎𝙀𝘼𝙍𝘾𝙃", "search").row()
+    .text("🛒 𝘾𝘼𝙍𝙏", "cart").text("♡ 𝙁𝘼𝙑𝙊𝙍𝙄𝙏𝙀𝙎", "favorites").row()
+    .text("📦 𝙈𝙔 𝙊𝙍𝘿𝙀𝙍𝙎", "orders").text("💎 𝙈𝙔 𝙋𝙊𝙄𝙉𝙏𝙎", "points").row()
+    .text("🔔 𝙍𝙀𝙎𝙏𝙊𝘾𝙆 𝘼𝙇𝙀𝙍𝙏𝙎", "restock").row()
+    .text("⭐ 𝙑𝙊𝙐𝘾𝙃 / 𝙍𝙀𝙑𝙄𝙀𝙒", "review").text("📨 𝙎𝙐𝙋𝙋𝙊𝙍𝙏", "support").row()
+    .text("☾ 𝙋𝙍𝙄𝘾𝙄𝙉𝙂", "pricing").text("༒ 𝙋𝘼𝙔𝙈𝙀𝙉𝙏", "payment").row()
+    .text("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏", "contact");
+  if (admin) k.row().text("♰ 𝘼𝘿𝙈𝙄𝙉 𝙋𝘼𝙉𝙀𝙇", "admin");
+  return k;
 }
+function homeKeyboard(id) { return mainMenu(isAdmin(id)); }
+function backHome(id) { return new InlineKeyboard().text("༒ 𝙃𝙊𝙈𝙀", "home"); }
 
-function orderMenu() {
-  return new InlineKeyboard()
-    .text("♱ 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ♱", "cat_new")
-    .row()
-    .text("♱ 𝙉𝙊 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂 ♱", "cat_nonew")
-    .row()
-    .text("☠ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 ☠", "cat_old")
-    .row()
-    .text("𓋹 𝙁𝙊𝙍𝙀𝙄𝙂𝙉 𓋹", "cat_foreign")
-    .row()
-    .text("𓋹 𝙋𝙃𝘽 𓋹", "cat_phb")
-    .row()
-    .text("༒ 𝙃𝙊𝙈𝙀", "home");
-}
-
-const foreignPrices = [
-  ["700", 400],
-  ["800", 600],
-  ["900", 650],
-  ["1000", 750],
-  ["1.2K", 850],
-  ["1.4K", 1150],
-  ["2.5K", 1800],
-  ["5.1K", 3500],
-  ["6K", 4500],
-  ["7K", 5300],
-  ["12K", 8300],
-  ["20K", 9700],
-];
-
-const phbPrices = [
-  ["100", 380],
-  ["200", 460],
-  ["300", 670],
-  ["400", 790],
-  ["500", 890],
-  ["600", 970],
-  ["700", 1500],
-  ["800", 1800],
-  ["900", 1900],
-  ["1K", 2400],
-  ["2.5K", 3200],
-  ["3K", 4300],
-];
-
+const foreignPrices = [["700",400],["800",600],["900",650],["1000",750],["1.2K",850],["1.4K",1150],["2.5K",1800],["5.1K",3500],["6K",4500],["7K",5300],["12K",8300],["20K",9700]];
+const phbPrices = [["100",380],["200",460],["300",670],["400",790],["500",890],["600",970],["700",1500],["800",1800],["900",1900],["1K",2400],["2.5K",3200],["3K",4300]];
 function pricingText() {
-  return `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐏𝐑𝐈𝐂𝐈𝐍𝐆 ♱
-
-༒︎ 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂
-• 100 followers — ₱90
-• 10+ accounts — ₱70/account
-
-☠︎︎ 𝙉𝙊 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂
-• 100 followers — ₱120
-• 10+ accounts — ₱90/account
-
-𓋹 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿
-• 2022–2024 — ₱350
-• 2015–2019 — ₱550
-
-♱ 𝟮𝟬𝟮𝟲 𝙁𝙊𝙍𝙀𝙄𝙂𝙉
-${foreignPrices.map(([size, price]) => `• ${size} — ${money(price)}`).join("\n")}
-
-♱ 𝟮𝟬𝟮𝟲 𝙋𝙃𝘽
-${phbPrices.map(([size, price]) => `• ${size} — ${money(price)}`).join("\n")}
-
-☠︎︎ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 𝘼𝘿𝘿-𝙊𝙉
-For Foreign / PHB:
-+ ₱350 per account
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`;
+  return `${header("𝐏𝐑𝐈𝐂𝐈𝐍𝐆")}\n\n༒ 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂\n• 100 followers — ₱90\n• 10+ accounts — ₱70/account\n\n☠︎︎ 𝙉𝙊 𝙉𝙀𝙒 𝙋𝙍𝙄𝘾𝙄𝙉𝙂\n• 100 followers — ₱120\n• 10+ accounts — ₱90/account\n\n𓋹 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿\n• 2022–2024 — ₱350\n• 2015–2019 — ₱550\n\n♱ 𝟮𝟬𝟮𝟲 𝙁𝙊𝙍𝙀𝙄𝙂𝙉\n${foreignPrices.map(([s,p])=>`• ${s} — ${money(p)}`).join("\n")}\n\n♱ 𝟮𝟬𝟮𝟲 𝙋𝙃𝘽\n${phbPrices.map(([s,p])=>`• ${s} — ${money(p)}`).join("\n")}\n\n☠︎︎ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 𝘼𝘿𝘿-𝙊𝙉\nFor Foreign / PHB: + ₱350 per account`;
 }
-
 function paymentText() {
-  return `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐌𝐎𝐃𝐄 𝐎𝐅 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱
-
-💳 𝙂𝘾𝘼𝙎𝙃
-
-Account Name:
-𝙒𝙞𝙡𝙡𝙞𝙚 𝙍𝙚𝙦𝙪𝙞𝙧𝙤𝙣
-
-Please make sure the amount sent
-matches your exact order total.
-
-After payment, submit your receipt
-through the order form.
-
-☠︎︎ Payment is manually verified.
-A submitted receipt does not automatically
-mean that payment has been approved.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`;
+  return `${header("𝐌𝐎𝐃𝐄 𝐎𝐅 𝐏𝐀𝐘𝐌𝐄𝐍𝐓")}\n\n💳 GCash — ${PAYMENT_METHODS.gcash.account}\n💳 Maya — ${PAYMENT_METHODS.maya.account}\n\nPayment is manually verified. A receipt does not automatically mean approval.`;
 }
 
-function categoryName(category) {
-  const names = {
-    new: "NEW PRICING",
-    nonew: "NO NEW PRICING",
-    old: "YEAR OLD",
-    foreign: "2026 FOREIGN",
-    phb: "2026 PHB",
-  };
+const startCaption = `${header("𝐎𝐑𝐃𝐄𝐑 𝐒𝐄𝐂𝐓𝐈𝐎𝐍")}\n\nᴛʜɪꜱ ʙᴏᴛ ɪꜱ ᴅᴇᴅɪᴄᴀᴛᴇᴅ ᴛᴏ ʏᴏᴜʀ ᴏʀᴅᴇʀ ʀᴇQᴜᴇꜱᴛꜱ.\n\nᴘʀᴏᴅᴜᴄᴛꜱ • ᴏʀᴅᴇʀꜱ • ᴘᴀʏᴍᴇɴᴛ • ꜱᴜᴘᴘᴏʀᴛ\n\nChoose an option below. ⛧`;
 
-  return names[category] || category;
+async function ensureUser(ctx) {
+  const u = await getUser(ctx.from.id);
+  u.username = ctx.from.username || u.username;
+  u.firstName = ctx.from.first_name || u.firstName;
+  await saveUser(u);
+  return u;
 }
-
-function showQuantityKeyboard(category) {
-  if (category === "foreign") {
-    return new InlineKeyboard(
-      foreignPrices.map(([size, price]) => [
-        {
-          text: `${size} — ${money(price)}`,
-          callback_data: `foreign_${size}_${price}`,
-        },
-      ])
-    ).row().text("༒ 𝙃𝙊𝙈𝙀", "home");
+async function sendStart(ctx) {
+  const u = await ensureUser(ctx);
+  if (u.banned) return ctx.reply("☠︎︎ Your access to this bot has been restricted.");
+  clearSession(ctx.from.id);
+  try {
+    await ctx.replyWithPhoto(START_IMAGE, { caption: startCaption, reply_markup: homeKeyboard(ctx.from.id) });
+  } catch {
+    await ctx.reply(startCaption, { reply_markup: homeKeyboard(ctx.from.id) });
   }
+}
+bot.command("start", sendStart);
+bot.command("cancel", async ctx => { clearSession(ctx.from.id); await ctx.reply("༒ 𝙊𝙧𝙙𝙚𝙧 𝙘𝙖𝙣𝙘𝙚𝙡𝙡𝙚𝙙.", { reply_markup: homeKeyboard(ctx.from.id) }); });
+bot.command("admin", async ctx => {
+  if (!isAdmin(ctx.from.id)) return ctx.reply("☠ Admin only.");
+  await ctx.reply(adminText(await listOrders(), await listProducts()), { reply_markup: adminMenu() });
+});
 
-  if (category === "phb") {
-    return new InlineKeyboard(
-      phbPrices.map(([size, price]) => [
-        {
-          text: `${size} — ${money(price)}`,
-          callback_data: `phb_${size}_${price}`,
-        },
-      ])
-    ).row().text("༒ 𝙃𝙊𝙈𝙀", "home");
-  }
+bot.use(async (ctx, next) => {
+  if (!ctx.from) return next();
+  const u = await getUser(ctx.from.id);
+  if (u.banned && !isAdmin(ctx.from.id)) return ctx.reply("☠︎︎ Your access to this bot has been restricted.");
+  return next();
+});
 
-  if (category === "old") {
-    return new InlineKeyboard()
-      .text("2022–2024 — ₱350", "old_350")
-      .row()
-      .text("2015–2019 — ₱550", "old_550")
-      .row()
-      .text("༒ 𝙃𝙊𝙈𝙀", "home");
-  }
-
+function adminMenu() {
   return new InlineKeyboard()
-    .text("1 account", `basic_${category}_1`)
-    .text("5 accounts", `basic_${category}_5`)
-    .row()
-    .text("10 accounts", `basic_${category}_10`)
-    .row()
+    .text("📊 𝘿𝘼𝙎𝙃𝘽𝙊𝘼𝙍𝘿", "admin_dash").text("🧾 𝙊𝙍𝘿𝙀𝙍𝙎", "admin_orders").row()
+    .text("📦 𝙋𝙍𝙊𝘿𝙐𝘾𝙏𝙎", "admin_products").text("👥 𝘾𝙐𝙎𝙏𝙊𝙈𝙀𝙍𝙎", "admin_customers").row()
+    .text("📢 𝘽𝙍𝙊𝘼𝘿𝘾𝘼𝙎𝙏", "admin_broadcast").text("📈 𝘼𝙉𝘼𝙇𝙔𝙏𝙄𝘾𝙎", "admin_analytics").row()
+    .text("🚫 𝘽𝘼𝙉 / 𝙐𝙉𝘽𝘼𝙉", "admin_ban").row()
     .text("༒ 𝙃𝙊𝙈𝙀", "home");
 }
-
-function nicheMenu(category, size, unitPrice) {
-  const keyboard = new InlineKeyboard()
-    .text("♱ 𝙎𝙄𝙉𝘾𝙀 𝟮𝟬𝟮𝟲 ♱", `niche_since_${category}_${size}_${unitPrice}`)
-    .row()
-    .text("☠ 𝙔𝙀𝘼𝙍 𝙊𝙇𝘿 (+₱350) ☠", `niche_old_${category}_${size}_${unitPrice}`)
-    .row()
-    .text("༒ 𝘽𝘼𝘾𝙆", "order");
-
-  return keyboard;
+function adminText(orders, products) {
+  const revenue = orders.filter(o=>["paid","processing","completed"].includes(o.status)).reduce((s,o)=>s+Number(o.total||0),0);
+  return `${header("𝐀𝐃𝐌𝐈𝐍 𝐃𝐀𝐒𝐇𝐁𝐎𝐀𝐑𝐃")}\n\n💰 Today's/recorded revenue: ${money(revenue)}\n🧾 Total orders: ${orders.length}\n⌛ Pending: ${orders.filter(o=>!["completed","cancelled","payment_failed"].includes(o.status)).length}\n📦 Available stock: ${products.reduce((s,p)=>s+Number(p.stock||0),0)}\n🛍 Products: ${products.length}\n\nStorage: ${persistent ? "PERSISTENT REDIS" : "TEMPORARY MEMORY — add KV_REST_API_URL + KV_REST_API_TOKEN"} `;
 }
 
-function calculateTotal(order) {
-  const quantity = Number(order.quantity || 1);
-  const basePrice = Number(order.unitPrice || 0);
-
-  const baseTotal = basePrice * quantity;
-
-  const oldFee =
-    order.niche === "year old" && (order.category === "foreign" || order.category === "phb")
-      ? 350 * quantity
-      : 0;
-
-  return {
-    baseTotal,
-    oldFee,
-    total: baseTotal + oldFee,
-  };
-}
-
-function summaryText(order) {
-  const totals = calculateTotal(order);
-
-  return `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐎𝐑𝐃𝐄𝐑 𝐒𝐔𝐌𝐌𝐀𝐑𝐘 ♱
-
-𝙘𝙖𝙩𝙚𝙜𝙤𝙧𝙮:
-${categoryName(order.category)}
-
-𝙦𝙪𝙖𝙣𝙩𝙞𝙩𝙮:
-${order.quantity}
-
-𝙣𝙞𝙘𝙝𝙚:
-${order.niche || "not applicable"}
-
-𝙗𝙖𝙨𝙚 𝙥𝙧𝙞𝙘𝙚:
-${money(order.unitPrice)} × ${order.quantity}
-= ${money(totals.baseTotal)}
-
-${
-  totals.oldFee > 0
-    ? `𝙮𝙚𝙖𝙧-𝙤𝙡𝙙 𝙖𝙙𝙙𝙞𝙩𝙞𝙤𝙣:
-₱350 × ${order.quantity}
-= ${money(totals.oldFee)}
-
-`
-    : ""
-}𝙩𝙤𝙩𝙖𝙡 𝙖𝙢𝙤𝙪𝙣𝙩:
-♱ ${money(totals.total)} ♱
-
-Please review your order carefully
-before proceeding to payment.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`;
-}
-
-function summaryKeyboard() {
-  return new InlineKeyboard()
-    .text("💳 𝙋𝘼𝙔 𝙉𝙊𝙒", "pay_order")
-    .row()
-    .text("༒ 𝘽𝘼𝘾𝙆", "order")
-    .text("☠ 𝘾𝘼𝙉𝘾𝙀𝙇", "cancel");
-}
-
-async function sendStart(ctx) {
-  const session = getSession(ctx.from.id);
-  session.step = "home";
-  session.order = {};
-
-  await ctx.replyWithPhoto(START_IMAGE, {
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐎𝐑𝐃𝐄𝐑 𝐒𝐄𝐂𝐓𝐈𝐎𝐍 ♱
-
-ᴛʜɪꜱ ʙᴏᴛ ɪꜱ ᴅᴇᴅɪᴄᴀᴛᴇᴅ ᴛᴏ ʏᴏᴜʀ
-ᴏʀᴅᴇʀ ʀᴇQᴜᴇꜱᴛꜱ.
-
-ᴘʟᴇᴀꜱᴇ ᴄʜᴏᴏꜱᴇ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ
-ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ. ⛧
-
-ᴍᴀɴᴜᴀʟ ᴏʀᴅᴇʀ ʜᴀɴᴅʟɪɴɢ
-♱ ᴘʀɪᴄɪɴɢ & ɪɴꜰᴏ
-𓋹 ꜱᴇʀᴠɪᴄᴇꜱ
-☠︎︎ ᴄᴏɴᴛᴀᴄᴛ
-
-ᴇᴠᴇʀʏ ʀᴇQᴜᴇꜱᴛ ɪꜱ ʜᴀɴᴅʟᴇᴅ
-ᴡɪᴛʜ ᴄᴀʀᴇ & ᴀᴛᴛᴇɴᴛɪᴏɴ.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: mainMenu(),
-  });
-}
-
-bot.command("start", async (ctx) => {
-  await sendStart(ctx);
-});
-
-bot.command("cancel", async (ctx) => {
-  sessions.delete(ctx.from.id);
-
-  await ctx.reply(
-    "༒ 𝙊𝙧𝙙𝙚𝙧 𝙘𝙖𝙣𝙘𝙚𝙡𝙡𝙚𝙙.\n\nSend /start to begin again.",
-    { reply_markup: mainMenu() }
-  );
-});
-
-bot.callbackQuery("home", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐘𝐕𝐀𝐈𝐍𝐄𝐋𝐘 𝐎𝐑𝐃𝐄𝐑 𝐒𝐄𝐂𝐓𝐈𝐎𝐍 ♱
-
-ᴛʜɪꜱ ʙᴏᴛ ɪꜱ ᴅᴇᴅɪᴄᴀᴛᴇᴅ ᴛᴏ ʏᴏᴜʀ
-ᴏʀᴅᴇʀ ʀᴇQᴜᴇꜱᴛꜱ.
-
-ᴘʟᴇᴀꜱᴇ ᴄʜᴏᴏꜱᴇ ᴀɴ ᴏᴘᴛɪᴏɴ ʙᴇʟᴏᴡ
-ᴛᴏ ᴄᴏɴᴛɪɴᴜᴇ. ⛧
-
-ᴍᴀɴᴜᴀʟ ᴏʀᴅᴇʀ ʜᴀɴᴅʟɪɴɢ
-♱ ᴘʀɪᴄɪɴɢ & ɪɴꜰᴏ
-𓋹 ꜱᴇʀᴠɪᴄᴇꜱ
-☠︎︎ ᴄᴏɴᴛᴀᴄᴛ
-
-ᴇᴠᴇʀʏ ʀᴇQᴜᴇꜱᴛ ɪꜱ ʜᴀɴᴅʟᴇᴅ
-ᴡɪᴛʜ ᴄᴀʀᴇ & ᴀᴛᴛᴇɴᴛɪᴏɴ.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: mainMenu(),
-  });
-});
-
-bot.callbackQuery("order", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const session = getSession(ctx.from.id);
-  session.step = "category";
-  session.order = {};
-
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐎𝐑𝐃𝐄𝐑 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 ♱
-
-please select a category below.
-
-choose the option that matches
-the item you want to request.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: orderMenu(),
-  });
-});
-
-bot.callbackQuery("pricing", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  await ctx.editMessageCaption({
-    caption: pricingText(),
-    reply_markup: backHome(),
-  });
-});
-
-bot.callbackQuery("payment", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  await ctx.replyWithPhoto(PAYMENT_QR, {
-    caption: paymentText(),
-    reply_markup: backHome(),
-  });
-});
-
-bot.callbackQuery("contact", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐂𝐎𝐍𝐓𝐀𝐂𝐓 ♱
-
-For questions or order assistance,
-please contact:
-
-@yvaines_tg
-
-`,
-    reply_markup: new InlineKeyboard()
-      .url("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 𝙔𝙑𝘼𝙄𝙉𝙀 ☠", CONTACT)
-      .row()
-      .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
-  });
-});
-
-bot.callbackQuery("myorder", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const order = orders.get(ctx.from.id);
-
-  if (!order) {
-    await ctx.editMessageCaption({
-      caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐌𝐘 𝐎𝐑𝐃𝐄𝐑 ♱
-
-No order has been recorded yet.
-
-Please choose ORDER FORM
-to create an order request.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-      reply_markup: new InlineKeyboard()
-        .text("♱ 𝙊𝙍𝘿𝙀𝙍 𝙁𝙊𝙍𝙈 ♱", "order")
-        .row()
-        .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
-    });
-
-    return;
+async function productCatalog(category = null, query = null) {
+  let products = await listProducts();
+  if (category) products = products.filter(p => String(p.category).toLowerCase() === String(category).toLowerCase());
+  if (query) {
+    const q = query.toLowerCase();
+    products = products.filter(p => `${p.name} ${p.category} ${p.description||""}`.toLowerCase().includes(q));
   }
-
-  const totals = calculateTotal(order);
-
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐌𝐘 𝐎𝐑𝐃𝐄𝐑 ♱
-
-category:
-${categoryName(order.category)}
-
-quantity:
-${order.quantity}
-
-niche:
-${order.niche || "not applicable"}
-
-total:
-${money(totals.total)}
-
-status:
-${order.status || "pending"}
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: backHome(),
-  });
-});
-
-for (const category of ["new", "nonew"]) {
-  bot.callbackQuery(`cat_${category}`, async (ctx) => {
-    await ctx.answerCallbackQuery();
-
-    const session = getSession(ctx.from.id);
-    session.order = {
-      category,
-    };
-
-    await ctx.editMessageCaption({
-      caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ ${categoryName(category)} ♱
-
-please select the quantity below.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-      reply_markup: showQuantityKeyboard(category),
-    });
-  });
+  return products;
+}
+function productKeyboard(products, prefix="prod") {
+  const k = new InlineKeyboard();
+  products.slice(0,30).forEach(p => k.text(`${p.stock>0?"♱":"☠"} ${p.name} — ${money(p.price)}`, `${prefix}:${p.id}`).row());
+  k.text("༒ 𝙃𝙊𝙈𝙀", "home");
+  return k;
+}
+function productText(p) {
+  return `${header(p.name)}\n\n${p.description || "No description."}\n\nCategory: ${p.category || "General"}\nPrice: ${money(p.price)}\nStock: ${p.stock > 0 ? p.stock : "OUT OF STOCK"}\n\n♡ Save to favorites or add to cart.`;
+}
+function productDetailKeyboard(p, user) {
+  const fav = user.favorites.includes(p.id);
+  const k = new InlineKeyboard()
+    .text("🛒 𝘼𝘿𝘿 𝙏𝙊 𝘾𝘼𝙍𝙏", `addcart:${p.id}`).row()
+    .text(fav ? "♥ 𝙍𝙀𝙈𝙊𝙑𝙀 𝙁𝘼𝙑" : "♡ 𝙁𝘼𝙑𝙊𝙍𝙄𝙏𝙀", `fav:${p.id}`).row();
+  if (p.stock <= 0) k.text("🔔 𝙉𝙊𝙏𝙄𝙁𝙔 𝙈𝙀", `watch:${p.id}`).row();
+  k.text("༒ 𝘽𝘼𝘾𝙆", "shop").text("☠ 𝙃𝙊𝙈𝙀", "home");
+  return k;
 }
 
-bot.callbackQuery("cat_old", async (ctx) => {
+async function showProducts(ctx, products = await productCatalog()) {
+  await ctx.reply(`${header("𝐏𝐑𝐎𝐃𝐔𝐂𝐓 𝐂𝐀𝐓𝐀𝐋𝐎𝐆")}\n\nSelect a product below.`, { reply_markup: productKeyboard(products) });
+}
+bot.callbackQuery("shop", async ctx => { await ctx.answerCallbackQuery(); await showProducts(ctx); });
+bot.callbackQuery(/^prod:(.+)$/, async ctx => {
   await ctx.answerCallbackQuery();
-
-  const session = getSession(ctx.from.id);
-  session.order = {
-    category: "old",
-  };
-
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐘𝐄𝐀𝐑 𝐎𝐋𝐃 ♱
-
-please select the year range.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: showQuantityKeyboard("old"),
-  });
+  const p = await getProduct(ctx.match[1]); if (!p) return ctx.reply("Product unavailable.");
+  await ctx.reply(productText(p), { reply_markup: productDetailKeyboard(p, await getUser(ctx.from.id)) });
+});
+bot.callbackQuery(/^addcart:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+  const p = await getProduct(ctx.match[1]); if (!p || p.stock <= 0) return ctx.reply("☠ Out of stock.");
+  const s = session(ctx.from.id);
+  const item = s.cart.find(x=>x.productId===p.id);
+  if (item) item.quantity++;
+  else s.cart.push({ productId:p.id, quantity:1, price:p.price, name:p.name });
+  await ctx.reply(`🛒 Added **${p.name}** to your cart.`, { parse_mode:"Markdown", reply_markup:new InlineKeyboard().text("🛒 VIEW CART","cart").text("♱ CONTINUE SHOPPING","shop") });
+});
+bot.callbackQuery(/^fav:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+  const u = await getUser(ctx.from.id), id=ctx.match[1], i=u.favorites.indexOf(id);
+  if(i>=0) u.favorites.splice(i,1); else u.favorites.push(id);
+  await saveUser(u);
+  const p=await getProduct(id); if(p) await ctx.editMessageText(productText(p),{reply_markup:productDetailKeyboard(p,u)});
+});
+bot.callbackQuery("favorites", async ctx => {
+  await ctx.answerCallbackQuery();
+  const u=await getUser(ctx.from.id), ps=[];
+  for(const id of u.favorites){const p=await getProduct(id);if(p)ps.push(p);}
+  await ctx.reply(`${header("𝐅𝐀𝐕𝐎𝐑𝐈𝐓𝐄𝐒")}\n\n${ps.length?"Your saved products:":"No favorites yet."}`,{reply_markup:productKeyboard(ps,"prod")});
+});
+bot.callbackQuery(/^watch:(.+)$/, async ctx => {
+  await ctx.answerCallbackQuery();
+  const u=await getUser(ctx.from.id), id=ctx.match[1];
+  if(!u.watching.includes(id)) u.watching.push(id);
+  await saveUser(u);
+  await ctx.reply("🔔 You'll be notified when this product is restocked.");
+});
+bot.callbackQuery("restock", async ctx => {
+  await ctx.answerCallbackQuery();
+  const u=await getUser(ctx.from.id), ps=[];
+  for(const id of u.watching){const p=await getProduct(id);if(p)ps.push(p);}
+  await ctx.reply(`${header("𝐑𝐄𝐒𝐓𝐎𝐂𝐊 𝐀𝐋𝐄𝐑𝐓𝐒")}\n\n${ps.map(p=>`• ${p.name} — ${p.stock>0?"AVAILABLE":"WAITING"}`).join("\n")||"No alerts saved."}`,{reply_markup:backHome(ctx.from.id)});
 });
 
-for (const category of ["foreign", "phb"]) {
-  bot.callbackQuery(`cat_${category}`, async (ctx) => {
-    await ctx.answerCallbackQuery();
-
-    const session = getSession(ctx.from.id);
-    session.order = {
-      category,
-    };
-
-    await ctx.editMessageCaption({
-      caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ ${categoryName(category)} ♱
-
-select the size/price tier below.
-
-after selecting it, you will choose:
-
-• since 2026
-• year old (+₱350/account)
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-      reply_markup: showQuantityKeyboard(category),
-    });
-  });
+function cartTotal(cart){return cart.reduce((s,x)=>s+Number(x.price)*Number(x.quantity),0);}
+function cartKeyboard(cart){
+  const k=new InlineKeyboard();
+  cart.forEach(x=>k.text(`➖ ${x.name}`,"cartminus:"+x.productId).text(`➕`,"cartplus:"+x.productId).row());
+  if(cart.length) k.text("💳 𝘾𝙃𝙀𝘾𝙆𝙊𝙐𝙏","checkout").row().text("🗑 𝘾𝙇𝙀𝘼𝙍","clearcart").row();
+  return k.text("༒ 𝙃𝙊𝙈𝙀","home");
 }
+async function showCart(ctx){
+  const s=session(ctx.from.id);
+  const lines=s.cart.map(x=>`• ${x.name} × ${x.quantity} = ${money(x.price*x.quantity)}`).join("\n");
+  await ctx.reply(`${header("𝐌𝐘 𝐂𝐀𝐑𝐓")}\n\n${lines||"Your cart is empty."}\n\nTOTAL: ♱ ${money(cartTotal(s.cart))} ♱`,{reply_markup:cartKeyboard(s.cart)});
+}
+bot.callbackQuery("cart",async ctx=>{await ctx.answerCallbackQuery();await showCart(ctx);});
+bot.callbackQuery(/^cartplus:(.+)$/,async ctx=>{await ctx.answerCallbackQuery();const s=session(ctx.from.id),p=await getProduct(ctx.match[1]);if(p&&p.stock>0){const i=s.cart.find(x=>x.productId===p.id);if(i)i.quantity++;}await showCart(ctx);});
+bot.callbackQuery(/^cartminus:(.+)$/,async ctx=>{await ctx.answerCallbackQuery();const s=session(ctx.from.id),i=s.cart.findIndex(x=>x.productId===ctx.match[1]);if(i>=0){s.cart[i].quantity--;if(s.cart[i].quantity<=0)s.cart.splice(i,1);}await showCart(ctx);});
+bot.callbackQuery("clearcart",async ctx=>{await ctx.answerCallbackQuery();session(ctx.from.id).cart=[];await showCart(ctx);});
 
-bot.on("callback_query:data", async (ctx) => {
-  const data = ctx.callbackQuery.data;
+bot.callbackQuery("checkout",async ctx=>{
+  await ctx.answerCallbackQuery();
+  const s=session(ctx.from.id); if(!s.cart.length)return ctx.reply("Cart is empty.");
+  const products=[]; for(const item of s.cart){const p=await getProduct(item.productId);if(!p||p.stock<item.quantity)return ctx.reply(`☠ Not enough stock for ${item.name}.`);products.push(p);}
+  const total=cartTotal(s.cart), id=orderId();
+  const o={id,userId:ctx.from.id,username:ctx.from.username||"",items:s.cart.map(x=>({...x})),total,status:"pending",paymentMethod:null,receiptFileId:null,createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+PAYMENT_TIMEOUT).toISOString(),history:[{status:"pending",at:new Date().toISOString()}]};
+  await saveOrder(o); s.draft={orderId:id};
+  await ctx.reply(`${header("𝐎𝐑𝐃𝐄𝐑 𝐑𝐄𝐂𝐄𝐈𝐏𝐓")}\n\n🆔 Order ID: ${id}\n${s.cart.map(x=>`• ${x.name} × ${x.quantity}`).join("\n")}\n\nTOTAL: ♱ ${money(total)} ♱\n\n⏳ Payment window: 15 minutes\nChoose a payment method.`,{reply_markup:new InlineKeyboard().text("💳 GCASH","paymethod:gcash").text("💳 MAYA","paymethod:maya").row().text("☠ CANCEL","cancelorder:"+id)});
+});
+bot.callbackQuery(/^cancelorder:(.+)$/,async ctx=>{await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o||o.userId!==ctx.from.id)return ctx.reply("Order not found.");if(["completed","cancelled"].includes(o.status))return;await updateOrderStatus(o,"cancelled");await ctx.reply(`☠ Order ${o.id} cancelled.`);});
+bot.callbackQuery(/^paymethod:(gcash|maya)$/,async ctx=>{
+  await ctx.answerCallbackQuery();
+  const method=ctx.match[1], o=await getOrder(session(ctx.from.id).draft.orderId);
+  if(!o)return ctx.reply("Order expired.");
+  o.paymentMethod=method; await saveOrder(o);
+  const m=PAYMENT_METHODS[method];
+  await ctx.replyWithPhoto(PAYMENT_QR,{caption:`${header("𝐏𝐀𝐘𝐌𝐄𝐍𝐓")}\n\nOrder: ${o.id}\nMethod: ${m.name}\nAccount: ${m.account}\nAmount: ♱ ${money(o.total)} ♱\n\n⏳ Please pay within 15 minutes.\n📸 Then send your payment receipt photo in this chat.`,reply_markup:new InlineKeyboard().text("༒ 𝙈𝙔 𝙊𝙍𝘿𝙀𝙍","orders")});
+});
+bot.on("message:photo",async ctx=>{
+  const s=session(ctx.from.id), id=s.draft.orderId; if(!id)return;
+  const o=await getOrder(id); if(!o||o.status==="cancelled")return;
+  o.receiptFileId=ctx.message.photo.at(-1).file_id;
+  o.status="payment_review"; o.history.push({status:o.status,at:new Date().toISOString()}); await saveOrder(o);
+  await ctx.reply(`${header("𝐑𝐄𝐂𝐄𝐈𝐏𝐓 𝐑𝐄𝐂𝐄𝐈𝐕𝐄𝐃")}\n\nOrder: ${o.id}\nStatus: ⌛ Payment review\n\nPlease wait for admin approval.`);
+  await bot.api.sendPhoto(OWNER_ID,o.receiptFileId,{caption:`♱ 𝐍𝐄𝐖 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱\n\nOrder: ${o.id}\nCustomer: ${userName(ctx)}\nAmount: ${money(o.total)}\nMethod: ${PAYMENT_METHODS[o.paymentMethod]?.name||"Unknown"}\n\nApprove only after verifying the actual payment.`,reply_markup:new InlineKeyboard().text("✅ APPROVE",`approve:${o.id}`).text("❌ REJECT",`reject:${o.id}`).row().text("⚙️ PROCESSING",`processing:${o.id}`)});
+});
 
-  if (
-    data.startsWith("foreign_") ||
-    data.startsWith("phb_")
-  ) {
-    await ctx.answerCallbackQuery();
-
-    const [category, size, price] = data.split("_");
-
-    const session = getSession(ctx.from.id);
-
-    session.order = {
-      ...session.order,
-      category,
-      size,
-      quantity: 1,
-      unitPrice: Number(price),
-    };
-
-    await ctx.editMessageCaption({
-      caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-selected:
-${categoryName(category)}
-
-size:
-${size}
-
-price:
-${money(price)} per account
-
-now choose the niche:
-
-♱ since 2026
-☠ year old (+₱350/account)
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-      reply_markup: nicheMenu(category, size, price),
-    });
-
-    return;
-  }
-
-  if (
-    data.startsWith("niche_since_") ||
-    data.startsWith("niche_old_")
-  ) {
-    await ctx.answerCallbackQuery();
-
-    const parts = data.split("_");
-
-    const type = parts[1];
-    const category = parts[2];
-    const size = parts[3];
-    const unitPrice = Number(parts[4]);
-
-    const session = getSession(ctx.from.id);
-
-    session.order = {
-      ...session.order,
-      category,
-      size,
-      quantity: 1,
-      unitPrice,
-      niche: type === "since" ? "since 2026" : "year old",
-    };
-
-    await ctx.editMessageCaption({
-      caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-${summaryText(session.order)}
-
-If you need more than 1 account,
-send the quantity as a number below.
-
-Example:
-2
-5
-10
-
-`,
-      reply_markup: new InlineKeyboard()
-        .text("1 account", "qty_1")
-        .text("2 accounts", "qty_2")
-        .row()
-        .text("5 accounts", "qty_5")
-        .text("10 accounts", "qty_10")
-        .row()
-        .text("༒ 𝘾𝙊𝙉𝙁𝙄𝙍𝙈 𝙏𝙊𝙏𝘼𝙇 ༒", "confirm_quantity")
-        .row()
-        .text("༒ 𝘽𝘼𝘾𝙆", "order"),
-    });
-
-    return;
-  }
-
-  if (data.startsWith("basic_")) {
-    await ctx.answerCallbackQuery();
-
-    const [, category, quantity] = data.split("_");
-
-    let unitPrice;
-
-    if (category === "new") {
-      unitPrice = Number(quantity) >= 10 ? 70 : 90;
-    } else {
-      unitPrice = Number(quantity) >= 10 ? 90 : 120;
+async function updateOrderStatus(o,status){
+  o.status=status;
+  o.updatedAt=new Date().toISOString();
+  o.history=o.history||[];
+  o.history.push({status,at:o.updatedAt});
+  await saveOrder(o);
+}
+bot.callbackQuery(/^approve:(.+)$/,async ctx=>{
+  if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});
+  await ctx.answerCallbackQuery();
+  const o=await getOrder(ctx.match[1]);if(!o)return;
+  // Deduct stock only after payment is approved.
+  for (const item of o.items) {
+    const p = await getProduct(item.productId);
+    if (!p || Number(p.stock) < Number(item.quantity)) {
+      return ctx.reply(`☠ Cannot approve ${o.id}: insufficient stock for ${item.name}. Update stock first.`);
     }
-
-    const session = getSession(ctx.from.id);
-
-    session.order = {
-      category,
-      quantity: Number(quantity),
-      unitPrice,
-      niche: "not applicable",
-    };
-
-    await ctx.editMessageCaption({
-      caption: summaryText(session.order),
-      reply_markup: summaryKeyboard(),
-    });
-
-    return;
   }
-
-  if (data.startsWith("old_")) {
-    await ctx.answerCallbackQuery();
-
-    const unitPrice = Number(data.split("_")[1]);
-
-    const session = getSession(ctx.from.id);
-
-    session.order = {
-      category: "old",
-      quantity: 1,
-      unitPrice,
-      niche: "year range",
-    };
-
-    await ctx.editMessageCaption({
-      caption: summaryText(session.order),
-      reply_markup: new InlineKeyboard()
-        .text("1 account", "oldqty_1")
-        .text("2 accounts", "oldqty_2")
-        .row()
-        .text("5 accounts", "oldqty_5")
-        .text("10 accounts", "oldqty_10")
-        .row()
-        .text("༒ 𝙋𝘼𝙔 𝙉𝙊𝙒 ༒", "pay_order")
-        .row()
-        .text("༒ 𝘽𝘼𝘾𝙆", "order"),
-    });
-
-    return;
+  for (const item of o.items) {
+    const p = await getProduct(item.productId);
+    p.stock = Number(p.stock) - Number(item.quantity);
+    await saveProduct(p);
   }
+  await updateOrderStatus(o,"paid");
+  const u=await getUser(o.userId);const earned=Math.max(1,Math.floor(o.total/100));u.points+=earned;await saveUser(u);
+  await bot.api.sendMessage(o.userId,`${header("𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃")}
 
-  if (data.startsWith("qty_")) {
-    await ctx.answerCallbackQuery();
+🧾 ORDER RECEIPT
+🆔 ${o.id}
+${o.items.map(x=>`• ${x.name} × ${x.quantity}`).join("\n")}
 
-    const quantity = Number(data.split("_")[1]);
-    const session = getSession(ctx.from.id);
+💰 TOTAL: ${money(o.total)}
+💳 ${PAYMENT_METHODS[o.paymentMethod]?.name||"Payment"}
+📦 STATUS: ♱ PAID ♱
 
-    session.order.quantity = quantity;
+💎 Loyalty points earned: ${earned}`,{reply_markup:new InlineKeyboard().text("⚙️ PROCESSING","customer_processing:"+o.id).text("📦 MY ORDERS","orders")});
+  await ctx.editMessageCaption({caption:(ctx.callbackQuery.message.caption||"")+"\n\n♱ APPROVED ♱"});
+});
+bot.callbackQuery(/^reject:(.+)$/,async ctx=>{
+  if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});
+  await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o)return;
+  await updateOrderStatus(o,"payment_failed");
+  await bot.api.sendMessage(o.userId,`☠ Payment for ${o.id} was not verified.\n\nPlease make the payment correctly and submit a new receipt.`,{reply_markup:new InlineKeyboard().text("💳 𝙋𝘼𝙔 𝘼𝙂𝘼𝙄𝙉","orders")});
+  await ctx.editMessageCaption({caption:(ctx.callbackQuery.message.caption||"")+"\n\n☠ REJECTED ☠"});
+});
+bot.callbackQuery(/^processing:(.+)$/,async ctx=>{
+  if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});
+  await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o)return;await updateOrderStatus(o,"processing");await bot.api.sendMessage(o.userId,`⚙️ Order ${o.id} is now processing.`);await ctx.editMessageCaption({caption:(ctx.callbackQuery.message.caption||"")+"\n\n⚙️ PROCESSING"});});
+bot.callbackQuery(/^customer_processing:(.+)$/,async ctx=>{await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o||o.userId!==ctx.from.id)return;await bot.api.sendMessage(OWNER_ID,`Customer ${userName(ctx)} is asking about order ${o.id}.`);await ctx.reply("📨 Your request has been sent to support.");});
 
-    await ctx.editMessageCaption({
-      caption: summaryText(session.order),
-      reply_markup: summaryKeyboard(),
-    });
+bot.callbackQuery("orders",async ctx=>{
+  await ctx.answerCallbackQuery();const os=(await listOrders()).filter(o=>o.userId===ctx.from.id).slice(0,20);
+  const k=new InlineKeyboard();os.forEach(o=>k.text(`${o.id} — ${o.status} — ${money(o.total)}`,`vieworder:${o.id}`).row());k.text("༒ 𝙃𝙊𝙈𝙀","home");
+  await ctx.reply(`${header("𝐎𝐑𝐃𝐄𝐑 𝐇𝐈𝐒𝐓𝐎𝐑𝐘")}\n\n${os.length?"Select an order:":"No orders yet."}`,{reply_markup:k});
+});
+bot.callbackQuery(/^vieworder:(.+)$/,async ctx=>{
+  await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o||o.userId!==ctx.from.id)return ctx.reply("Order not found.");
+  const countdown=o.expiresAt&&o.status==="pending"?Math.max(0,Math.floor((new Date(o.expiresAt)-Date.now())/1000)):0;
+  await ctx.reply(`${header("𝐎𝐑𝐃𝐄𝐑 𝐓𝐑𝐀𝐂𝐊𝐈𝐍𝐆")}\n\n🆔 ${o.id}\n\n${o.items.map(x=>`• ${x.name} × ${x.quantity}`).join("\n")}\n\nTOTAL: ${money(o.total)}\n💳 Payment: ${o.paymentMethod||"Not selected"}\n\nSTATUS: ♱ ${o.status.toUpperCase()} ♱\n${countdown?`⏳ Payment expires in about ${Math.ceil(countdown/60)} minute(s).`:""}`,{reply_markup:new InlineKeyboard().text("⭐ 𝙇𝙀𝘼𝙑𝙀 𝙍𝙀𝙑𝙄𝙀𝙒","review:"+o.id).row().text("📨 𝙎𝙐𝙋𝙋𝙊𝙍𝙏","support").text("༒ 𝙃𝙊𝙈𝙀","home")});
+});
 
-    return;
+bot.callbackQuery("points",async ctx=>{await ctx.answerCallbackQuery();const u=await getUser(ctx.from.id);await ctx.reply(`${header("𝐋𝐎𝐘𝐀𝐋𝐓𝐘 𝐏𝐎𝐈𝐍𝐓𝐒")}\n\n💎 Current points: ${u.points}\n\nYou earn 1 point per ₱100 on approved payments.\n\nPoints are stored on your account.`,{reply_markup:backHome(ctx.from.id)});});
+
+bot.callbackQuery("review",async ctx=>{await ctx.answerCallbackQuery();await ctx.reply(`${header("𝐑𝐄𝐕𝐈𝐄𝐖 / 𝐕𝐎𝐔𝐂𝐇")}\n\nSend your feedback as a message.\n\nExample: “fast transaction, smooth order ♡”`);session(ctx.from.id).step="review";});
+bot.callbackQuery(/^review:(.+)$/,async ctx=>{await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o||o.userId!==ctx.from.id)return ctx.reply("Order not found.");session(ctx.from.id).draft.reviewOrder=o.id;session(ctx.from.id).step="review";await ctx.reply("⭐ Send your review/vouch now.");});
+
+bot.callbackQuery("support",async ctx=>{await ctx.answerCallbackQuery();session(ctx.from.id).step="support";await ctx.reply(`${header("𝐂𝐎𝐍𝐓𝐀𝐂𝐓 𝐒𝐔𝐏𝐏𝐎𝐑𝐓")}\n\nSend your concern in one message and a support ticket will be created.`);});
+bot.callbackQuery("search",async ctx=>{await ctx.answerCallbackQuery();session(ctx.from.id).step="search";await ctx.reply("🔎 Send a product name, username, category, or keyword to search.");});
+
+bot.callbackQuery("home",async ctx=>{await ctx.answerCallbackQuery();try{await ctx.editMessageText(startCaption,{reply_markup:homeKeyboard(ctx.from.id)});}catch{await ctx.reply(startCaption,{reply_markup:homeKeyboard(ctx.from.id)});}});
+bot.callbackQuery("pricing",async ctx=>{await ctx.answerCallbackQuery();await ctx.reply(pricingText(),{reply_markup:backHome(ctx.from.id)});});
+bot.callbackQuery("payment",async ctx=>{await ctx.answerCallbackQuery();await ctx.replyWithPhoto(PAYMENT_QR,{caption:paymentText(),reply_markup:backHome(ctx.from.id)});});
+bot.callbackQuery("contact",async ctx=>{await ctx.answerCallbackQuery();await ctx.reply(`${header("𝐂𝐎𝐍𝐓𝐀𝐂𝐓")}\n\nFor direct assistance:\n\n@yvaines_tg`,{reply_markup:new InlineKeyboard().url("☠ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 𝙔𝙑𝘼𝙄𝙉𝙀",CONTACT).row().text("༒ 𝙃𝙊𝙈𝙀","home")});});
+
+bot.on("message:text",async ctx=>{
+  const s=session(ctx.from.id), text=ctx.message.text.trim();
+  if(text.startsWith("/"))return;
+  if(s.step==="search"){
+    s.step="home";await showProducts(ctx,await productCatalog(null,text));return;
   }
-
-  if (data.startsWith("oldqty_")) {
-    await ctx.answerCallbackQuery();
-
-    const quantity = Number(data.split("_")[1]);
-    const session = getSession(ctx.from.id);
-
-    session.order.quantity = quantity;
-
-    await ctx.editMessageCaption({
-      caption: summaryText(session.order),
-      reply_markup: summaryKeyboard(),
-    });
-
-    return;
+  if(s.step==="review"){
+    const u=await getUser(ctx.from.id);const oid=s.draft.reviewOrder||null;
+    u.reviews.push({orderId:oid,text,at:new Date().toISOString()});await saveUser(u);
+    s.step="home";await ctx.reply("⭐ Thank you for your review/vouch ♡",{reply_markup:homeKeyboard(ctx.from.id)});return;
   }
-
-  if (data === "confirm_quantity") {
-    await ctx.answerCallbackQuery();
-
-    const session = getSession(ctx.from.id);
-
-    await ctx.editMessageCaption({
-      caption: summaryText(session.order),
-      reply_markup: summaryKeyboard(),
-    });
-
-    return;
+  if(s.step==="support"){
+    const ticket={id:`T-${Date.now().toString(36).toUpperCase()}`,userId:ctx.from.id,username:userName(ctx),text,status:"open",createdAt:new Date().toISOString()};
+    await set(`yf:ticket:${ticket.id}`,ticket);await addSet("yf:tickets:index",ticket.id);
+    await bot.api.sendMessage(OWNER_ID,`📨 NEW SUPPORT TICKET\n\n${ticket.id}\nCustomer: ${ticket.username}\n\n${text}`,{reply_markup:new InlineKeyboard().text("☠ CONTACT CUSTOMER",`supportuser:${ctx.from.id}`)});
+    s.step="home";await ctx.reply(`📨 Ticket ${ticket.id} created.\n\nSupport has been notified.`,{reply_markup:homeKeyboard(ctx.from.id)});return;
   }
 });
 
-bot.callbackQuery("cancel", async (ctx) => {
-  await ctx.answerCallbackQuery();
+bot.callbackQuery("admin",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();await ctx.reply(adminText(await listOrders(),await listProducts()),{reply_markup:adminMenu()});});
+bot.callbackQuery("admin_dash",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();await ctx.reply(adminText(await listOrders(),await listProducts()),{reply_markup:adminMenu()});});
+bot.callbackQuery("admin_orders",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const os=await listOrders();const k=new InlineKeyboard();os.slice(0,25).forEach(o=>k.text(`${o.id} • ${o.status}`,`adminorder:${o.id}`).row());k.text("༒ 𝙃𝙊𝙈𝙀","home");await ctx.reply(`${header("𝐎𝐑𝐃𝐄𝐑 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}\n\nSelect an order.`,{reply_markup:k});});
+bot.callbackQuery(/^adminorder:(.+)$/,async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o)return;await ctx.reply(`${header(o.id)}\n\nCustomer: ${o.username||o.userId}\n${o.items.map(x=>`• ${x.name} × ${x.quantity}`).join("\n")}\n\nTotal: ${money(o.total)}\nStatus: ${o.status}`,{reply_markup:new InlineKeyboard().text("⚙️ PROCESSING",`processing:${o.id}`).text("✓ COMPLETE",`complete:${o.id}`).row().text("❌ CANCEL",`admincancel:${o.id}`).row()});});
+bot.callbackQuery(/^complete:(.+)$/,async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o)return;await updateOrderStatus(o,"completed");await bot.api.sendMessage(o.userId,`♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐎𝐌𝐏𝐋𝐄𝐓𝐄𝐃 ♱\n\n${o.id}\nYour order has been completed. Thank you ♡`);await ctx.reply("✓ Marked completed.");});
+bot.callbackQuery(/^admincancel:(.+)$/,async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const o=await getOrder(ctx.match[1]);if(!o)return;await updateOrderStatus(o,"cancelled");await ctx.reply("Order cancelled.");});
 
-  sessions.delete(ctx.from.id);
+bot.callbackQuery("admin_products",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const ps=await listProducts();await ctx.reply(`${header("𝐏𝐑𝐎𝐃𝐔𝐂𝐓 / 𝐒𝐓𝐎𝐂𝐊 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}\n\n${ps.map(p=>`• ${p.name} — ${money(p.price)} — stock ${p.stock}`).join("\n")||"No products yet."}\n\nUse /addproduct to add one.`,{reply_markup:adminMenu()});});
+bot.callbackQuery("admin_customers",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const ids=await listSet("yf:users:index");const users=[];for(const id of ids){const u=await getUser(id);if(u)users.push(u);}await ctx.reply(`${header("𝐂𝐔𝐒𝐓𝐎𝐌𝐄𝐑 𝐌𝐀𝐍𝐀𝐆𝐄𝐑")}\n\n${users.slice(0,30).map(u=>`• ${u.firstName||u.id} ${u.username?"("+u.username+")":""} — ${u.points} pts`).join("\n")||"No users recorded yet."}`,{reply_markup:adminMenu()});});
+bot.callbackQuery("admin_analytics",async ctx=>{if(!isAdmin(ctx.from.id))return ctx.answerCallbackQuery({text:"Admin only.",show_alert:true});await ctx.answerCallbackQuery();const os=await listOrders();const byStatus={};for(const o of os)byStatus[o.status]=(byStatus[o.status]||0)+1;await ctx.reply(`${header("𝐒𝐀𝐋𝐄𝐒 𝐀𝐍𝐀𝐋𝐘𝐓𝐈𝐂𝐒")}\n\nOrders: ${os.length}\nPaid: ${byStatus.paid||0}\nProcessing: ${byStatus.processing||0}\nCompleted: ${byStatus.completed||0}\nPending review: ${byStatus.payment_review||0}\nRevenue recorded: ${money(os.filter(o=>["paid","processing","completed"].includes(o.status)).reduce((s,o)=>s+Number(o.total),0))}`,{reply_markup:adminMenu()});});
 
-  await ctx.editMessageCaption({
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐀𝐍𝐂𝐄𝐋𝐋𝐄𝐃 ♱
-
-Your current order has been cancelled.
-
-Send /start to begin again.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    reply_markup: mainMenu(),
-  });
+bot.command("addproduct",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="addproduct";
+  await ctx.reply("➕ Send product in this format:\n\nName | Price | Stock | Category | Description\n\nExample:\n500 followers | 890 | 10 | PHB | available account");
+});
+bot.command("editstock",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="editstock";
+  await ctx.reply("📦 Send: product-id | new-stock");
+});
+bot.command("deleteproduct",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="deleteproduct";
+  await ctx.reply("🗑 Send the product ID to delete.");
+});
+bot.command("editproduct",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="editproduct";
+  await ctx.reply("✏️ Send: product-id | name | price | stock | category | description");
+});
+bot.command("tickets",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  const ids=await listSet("yf:tickets:index"); const lines=[];
+  for(const id of ids){const t=await get(`yf:ticket:${id}`);if(t)lines.push(`• ${t.id} — ${t.status} — ${t.username}\n${t.text}`);}
+  await ctx.reply(`${header("𝐒𝐔𝐏𝐏𝐎𝐑𝐓 𝐓𝐈𝐂𝐊𝐄𝐓𝐒")}\n\n${lines.join("\n\n")||"No tickets."}`);
+});
+bot.command("broadcast",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="broadcast";
+  await ctx.reply("📢 Send the broadcast message.");
+});
+bot.command("ban",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="ban";
+  await ctx.reply("🚫 Send the Telegram user ID to ban.");
+});
+bot.command("unban",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  session(ctx.from.id).step="unban";
+  await ctx.reply("♰ Send the Telegram user ID to unban.");
 });
 
-bot.callbackQuery("pay_order", async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const session = getSession(ctx.from.id);
-  const order = session.order;
-
-  if (!order || !order.category) {
-    await ctx.reply("Please start a new order with /start.");
-    return;
+bot.on("message:text",async ctx=>{
+  if(!isAdmin(ctx.from.id))return;
+  const s=session(ctx.from.id), text=ctx.message.text.trim();
+  if(s.step==="editproduct"){
+    const [id,name,price,stock,category,...desc]=text.split("|").map(x=>x.trim()),p=await getProduct(id);
+    if(!p||!name||isNaN(Number(price))||isNaN(Number(stock)))return ctx.reply("Invalid product ID or format.");
+    Object.assign(p,{name,price:Number(price),stock:Number(stock),category:category||p.category,description:desc.join(" | ")||p.description});
+    await saveProduct(p);s.step="home";await ctx.reply(`✏️ Updated ${p.name} (${p.id})`);return;
   }
-
-  const totals = calculateTotal(order);
-
-  order.status = "awaiting payment";
-  orders.set(ctx.from.id, {
-    ...order,
-    userId: ctx.from.id,
-    username: ctx.from.username || "",
-    firstName: ctx.from.first_name || "",
-  });
-
-  await ctx.replyWithPhoto(PAYMENT_QR, {
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 ♱
-
-Account Name:
-𝙒𝙞𝙡𝙡𝙞𝙚 𝙍𝙚𝙦𝙪𝙞𝙧𝙤𝙣
-
-Mode:
-𝙂𝘾𝘼𝙎𝙃
-
-Order total:
-♱ ${money(totals.total)} ♱
-
-Please send the exact amount.
-
-After payment, send your receipt
-as a photo in this chat.
-
-Your receipt will be manually reviewed.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-  });
-
-  await ctx.reply(
-    "☠︎︎ 𝙎𝙀𝙉𝘿 𝙔𝙊𝙐𝙍 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 𝙍𝙀𝘾𝙀𝙄𝙋𝙏 𝙃𝙀𝙍𝙀 ☠︎︎"
-  );
+  if(s.step==="addproduct"){
+    const [name,price,stock,category,...desc]=text.split("|").map(x=>x.trim());
+    if(!name||isNaN(Number(price))||isNaN(Number(stock)))return ctx.reply("Invalid format.");
+    const p={id:`P-${Date.now().toString(36).toUpperCase()}`,name,price:Number(price),stock:Number(stock),category:category||"General",description:desc.join(" | ")};
+    await saveProduct(p);s.step="home";await ctx.reply(`➕ Added ${p.name}\nID: ${p.id}`);return;
+  }
+  if(s.step==="editstock"){
+    const [id,stock]=text.split("|").map(x=>x.trim()),p=await getProduct(id);
+    if(!p||isNaN(Number(stock)))return ctx.reply("Product not found or invalid stock.");
+    const was=p.stock;p.stock=Math.max(0,Number(stock));await saveProduct(p);s.step="home";await ctx.reply(`📦 ${p.name} stock: ${was} → ${p.stock}`);
+    if(was<=0&&p.stock>0){
+      const ids=await listSet("yf:users:index");for(const uid of ids){const u=await getUser(uid);if(u?.watching?.includes(p.id)){await bot.api.sendMessage(uid,`🔔 RESTOCK ALERT\n\n${p.name} is available again!`,{reply_markup:new InlineKeyboard().text("🛍 VIEW PRODUCT",`prod:${p.id}`)});u.watching=u.watching.filter(x=>x!==p.id);await saveUser(u);}}
+    } return;
+  }
+  if(s.step==="deleteproduct"){const p=await getProduct(text);if(!p)return ctx.reply("Product not found.");await del(`yf:product:${p.id}`);await removeSet("yf:products:index",p.id);s.step="home";await ctx.reply(`🗑 Deleted ${p.name}`);return;}
+  if(s.step==="broadcast"){
+    const ids=await listSet("yf:users:index");let sent=0;for(const uid of ids){try{await bot.api.sendMessage(uid,text);sent++;}catch{}}s.step="home";await ctx.reply(`📢 Broadcast sent to ${sent} users.`);return;
+  }
+  if(s.step==="ban"||s.step==="unban"){
+    const id=text,u=await getUser(id);u.id=Number(id);u.banned=s.step==="ban";await saveUser(u);s.step="home";await ctx.reply(`${u.banned?"🚫 Banned":"♰ Unbanned"} ${id}`);return;
+  }
 });
 
-bot.on("message:photo", async (ctx) => {
-  const session = getSession(ctx.from.id);
-
-  if (!session?.order?.category) {
-    await ctx.reply(
-      "Please start an order first using /start."
-    );
-    return;
+export async function GET(req) {
+  const secret = process.env.CRON_SECRET;
+  if (secret && req.headers.get("authorization") !== `Bearer ${secret}`) {
+    return new Response("Unauthorized", { status: 401 });
   }
-
-  const order = session.order;
-  const totals = calculateTotal(order);
-
-  order.status = "payment verification";
-  orders.set(ctx.from.id, {
-    ...order,
-    userId: ctx.from.id,
-    username: ctx.from.username || "",
-    firstName: ctx.from.first_name || "",
-  });
-
-  const photos = ctx.message.photo;
-  const largest = photos[photos.length - 1];
-
-  const ownerKeyboard = new InlineKeyboard()
-    .text("♱ 𝘾𝙊𝙉𝙁𝙄𝙍𝙈 𝙋𝘼𝙔𝙈𝙀𝙉𝙏 ♱", `confirm_${ctx.from.id}`)
-    .row()
-    .text("☠ 𝙁𝘼𝙄𝙇 / 𝙍𝙀𝙅𝙀𝘾𝙏 ☠", `fail_${ctx.from.id}`);
-
-  await bot.api.sendPhoto(OWNER_ID, largest.file_id, {
-    caption: `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐍𝐄𝐖 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐑𝐄𝐐𝐔𝐄𝐒𝐓 ♱
-
-Customer:
-${ctx.from.first_name || "Unknown"}
-
-Username:
-@${ctx.from.username || "none"}
-
-Telegram ID:
-${ctx.from.id}
-
-Category:
-${categoryName(order.category)}
-
-Quantity:
-${order.quantity}
-
-Niche:
-${order.niche || "not applicable"}
-
-Base total:
-${money(totals.baseTotal)}
-
-Year-old fee:
-${money(totals.oldFee)}
-
-TOTAL:
-♱ ${money(totals.total)} ♱
-
-Status:
-𝙈𝘼𝙉𝙐𝘼𝙇 𝙑𝙀𝙍𝙄𝙁𝙄𝘾𝘼𝙏𝙄𝙊𝙉
-
-Do not approve automatically.
-Verify the actual payment and amount first.
-`,
-    reply_markup: ownerKeyboard,
-  });
-
-  await ctx.reply(`
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐑𝐄𝐂𝐄𝐈𝐏𝐓 𝐑𝐄𝐂𝐄𝐈𝐕𝐄𝐃 ♱
-
-Your receipt has been submitted
-for manual verification.
-
-Please wait for confirmation.
-
-No order release should happen
-until the payment has been verified.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`);
-});
-
-bot.callbackQuery(/^confirm_(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  if (String(ctx.from.id) !== String(OWNER_ID)) {
-    await ctx.answerCallbackQuery({
-      text: "Owner only.",
-      show_alert: true,
-    });
-    return;
-  }
-
-  const customerId = Number(ctx.match[1]);
-  const order = orders.get(customerId);
-
-  if (!order) {
-    await ctx.editMessageCaption({
-      caption: "Order information is no longer available.",
-    });
-    return;
-  }
-
-  order.status = "payment confirmed";
-  orders.set(customerId, order);
-
-  await bot.api.sendMessage(
-    customerId,
-    `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-♱ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐂𝐎𝐍𝐅𝐈𝐑𝐌𝐄𝐃 ♱
-
-Your payment has been manually verified.
-
-For your order details, please contact:
-
-@yvaines_tg
-
-Your order will be handled from there.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .url("♱ 𝘾𝙊𝙉𝙏𝘼𝘾𝙏 @𝙔𝙑𝘼𝙄𝙉𝙀𝙎_𝙏𝙂 ♱", CONTACT)
-        .row()
-        .text("☠ 𝙄𝙏𝙀𝙈 𝙍𝙀𝘾𝙀𝙄𝙑𝙀𝘿 ☠", `received_${customerId}`),
+  const now = Date.now();
+  const os = await listOrders();
+  let expired = 0;
+  for (const o of os) {
+    if (o.status === "pending" && o.expiresAt && new Date(o.expiresAt).getTime() <= now) {
+      await updateOrderStatus(o, "cancelled");
+      expired++;
+      try { await bot.api.sendMessage(o.userId, `☠ Order ${o.id} expired because payment was not received within 15 minutes.\n\nYou may create a new order anytime.`); } catch {}
     }
-  );
-
-  await ctx.editMessageCaption({
-    caption:
-      ctx.callbackQuery.message.caption +
-      "\n\n♱ PAYMENT CONFIRMED BY OWNER ♱",
-  });
-});
-
-bot.callbackQuery(/^fail_(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  if (String(ctx.from.id) !== String(OWNER_ID)) {
-    await ctx.answerCallbackQuery({
-      text: "Owner only.",
-      show_alert: true,
-    });
-    return;
   }
-
-  const customerId = Number(ctx.match[1]);
-  const order = orders.get(customerId);
-
-  if (order) {
-    order.status = "payment failed";
-    orders.set(customerId, order);
-  }
-
-  await bot.api.sendMessage(
-    customerId,
-    `
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-☠ 𝐏𝐀𝐘𝐌𝐄𝐍𝐓 𝐍𝐎𝐓 𝐕𝐄𝐑𝐈𝐅𝐈𝐄𝐃 ☠
-
-Please send the correct amount/receipt
-to make your purchase.
-
-Make sure the amount you send matches
-the exact order total shown above.
-
-After making the payment, send the
-new receipt here for another verification.
-
-No order release will happen until
-payment is verified.
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`,
-    {
-      reply_markup: new InlineKeyboard()
-        .text("♱ 𝙋𝘼𝙔 𝘼𝙂𝘼𝙄𝙉 ♱", "pay_order")
-        .row()
-        .text("༒ 𝙃𝙊𝙈𝙀 ༒", "home"),
-    }
-  );
-
-  await ctx.editMessageCaption({
-    caption:
-      ctx.callbackQuery.message.caption +
-      "\n\n☠ PAYMENT REJECTED / FAILED VERIFICATION ☠",
-  });
-});
-
-bot.callbackQuery(/^received_(\d+)$/, async (ctx) => {
-  await ctx.answerCallbackQuery();
-
-  const customerId = Number(ctx.match[1]);
-
-  if (customerId !== ctx.from.id) {
-    await ctx.answerCallbackQuery({
-      text: "This button belongs to another order.",
-      show_alert: true,
-    });
-    return;
-  }
-
-  const order = orders.get(customerId);
-
-  if (order) {
-    order.status = "completed";
-    orders.set(customerId, order);
-  }
-
-  await ctx.editMessageText(`
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧♱ ₊⋆ ☠︎︎༒︎
-
-thank you so much for your order ♡
-
-your order has been successfully completed.
-
-we truly appreciate your trust and support. 🕯️
-
-༒︎☠︎︎ ⋆₊ ♱𓋹⛧𓋹♱ ₊⋆ ☠︎︎༒︎
-`);
-
-  await bot.api.sendMessage(
-    OWNER_ID,
-    `
-♱ 𝐎𝐑𝐃𝐄𝐑 𝐂𝐎𝐌𝐏𝐋𝐄𝐓𝐄𝐃 ♱
-
-Customer:
-${ctx.from.first_name || "Unknown"}
-
-Username:
-@${ctx.from.username || "none"}
-
-Telegram ID:
-${ctx.from.id}
-
-The customer confirmed that the item
-was received.
-`
-  );
-});
+  return Response.json({ ok: true, expired, persistent });
+}
 
 export const POST = webhookCallback(bot, "std/http");
 export const runtime = "nodejs";
